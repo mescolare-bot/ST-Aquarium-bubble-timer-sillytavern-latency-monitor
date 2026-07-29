@@ -1,0 +1,13 @@
+{
+  "display_name": "Latency Profiler",
+  "name": "st-latency-profiler",
+  "author": "OpenAI",
+  "version": "0.1.0",
+  "description": "Browser-side timing profiler for SillyTavern message generation.",
+  "js": "index.js",
+  "css": "style.css",
+  "loading_order": 999,
+  "minimum_client_version": "1.12.6",
+  "auto_update": false,
+  "homePage": "https://github.com/your-name/st-latency-profiler"
+}

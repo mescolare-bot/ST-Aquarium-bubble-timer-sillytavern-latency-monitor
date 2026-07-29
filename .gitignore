@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# Runtime data
+data/
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+
+# Local environment
+.env
+.env.*
+
+# Remote patch scripts with embedded credentials
+backend-monitor-minimal/install-remote.mjs
+backend-monitor-minimal/patch-generate-route-remote.mjs
+backend-monitor-minimal/patch-prompt-trace-remote.mjs
+backend-monitor-minimal/patch-prompt-trace-ui-remote.mjs
+backend-monitor-minimal/fix-counter-helper-scope-remote.mjs
+backend-monitor-minimal/optimize-latest-reply-counter-remote.mjs
