@@ -59,6 +59,22 @@ async function countRuns() {
     }
 }
 
+async function clearRuns() {
+    const existingRuns = await countRuns();
+
+    try {
+        await fs.mkdir(LOG_DIR, { recursive: true });
+        await fs.writeFile(LOG_FILE, '', 'utf8');
+        return existingRuns;
+    } catch (error) {
+        if (error?.code === 'ENOENT') {
+            return 0;
+        }
+
+        throw error;
+    }
+}
+
 function average(numbers) {
     const valid = numbers.filter((n) => typeof n === 'number' && Number.isFinite(n));
     if (!valid.length) {
@@ -129,6 +145,21 @@ export async function init(router) {
             count: runs.length,
             runs,
         });
+    });
+
+    router.delete('/runs', async (_req, res) => {
+        try {
+            const clearedCount = await clearRuns();
+            res.json({
+                ok: true,
+                cleared_count: clearedCount,
+            });
+        } catch (error) {
+            res.status(500).json({
+                ok: false,
+                error: error instanceof Error ? error.message : String(error),
+            });
+        }
     });
 
     router.get('/runs/:id', async (req, res) => {

@@ -3,11 +3,11 @@
   "name": "st-latency-profiler",
   "author": "OpenAI",
   "version": "0.1.0",
-  "description": "Browser-side timing profiler for SillyTavern message generation.",
+  "description": "SillyTavern 对话链路后台监控面板，展示当前楼层生成耗时、异常阶段与优化建议。",
   "js": "index.js",
   "css": "style.css",
   "loading_order": 999,
   "minimum_client_version": "1.12.6",
   "auto_update": false,
-  "homePage": "https://github.com/your-name/st-latency-profiler"
+  "homePage": "https://github.com/mescolare-bot/ST-Aquarium-bubble-timer-sillytavern-latency-monitor"
 }
