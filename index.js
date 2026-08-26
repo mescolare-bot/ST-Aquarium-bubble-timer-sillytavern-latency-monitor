@@ -1,4 +1,6 @@
 import { eventSource, event_types, stopGeneration } from "../../../../script.js";
+// Namespace import so a missing export in an older SillyTavern build degrades instead of breaking module linking.
+import * as sillyTavernScript from "../../../../script.js";
 
 const MODULE_NAME = "st-latency-profiler";
 const MODULE_DISPLAY_NAME = "鱼缸后端监控";
@@ -15,6 +17,12 @@ const MOBILE_OPEN_GUARD_MS = 360;
 const WAITING_QUEUE_EDIT_LOCK_MS = 1500;
 const PENDING_INJECTION_SOURCE_TTL_MS = 10000;
 const SYNTHETIC_ESCAPE_IGNORE_WINDOW_MS = 800;
+const SEND_UI_UNLOCK_POLL_INTERVAL_MS = 50;
+const SEND_UI_UNLOCK_SELF_RECOVERY_MS = 1000;
+// SillyTavern's own post-abort swipe-back can hold swipeState for up to ~1s, so the risky
+// swipe-state reset waits longer than the cheap send-button unlock to avoid racing it.
+const SWIPE_STATE_RESET_GRACE_MS = 3000;
+const DEFAULT_SWIPE_STATE_NONE = "none";
 const DAILY_SUMMARY_DAY_OPTIONS = [7, 14, 30];
 let stRequestHeadersFactoryPromise = null;
 const THEME_MODE_SEQUENCE = ["dawn", "rose", "night", "follow_tavern"];
@@ -302,6 +310,7 @@ const state = {
     activeGenerationRequests: new Map(),
     sillyTavernGenerationActive: false,
     sillyTavernGenerationRecoveryUntil: 0,
+    sillyTavernSwipeConstants: undefined,
     pendingInjectionSource: null,
     chatWindowContext: {
         chatKey: "",
@@ -625,13 +634,15 @@ function findSillyTavernStopGenerationTrigger() {
         '[aria-label*="abort" i]',
         '[title*="abort" i]',
     ]);
-    if (directMatch) {
+    if (directMatch && !isMonitorRootElement(directMatch)) {
         return directMatch;
     }
 
     const candidates = Array.from(document.querySelectorAll("button, .menu_button, [role='button'], .interactable"));
     return candidates.find((candidate) => {
-        if (!(candidate instanceof HTMLElement) || !isVisibleElement(candidate)) {
+        // The monitor's own "终止生成" button matches the keyword scan through its id, so it must
+        // never be treated as SillyTavern's stop control.
+        if (!(candidate instanceof HTMLElement) || isMonitorRootElement(candidate) || !isVisibleElement(candidate)) {
             return false;
         }
 
@@ -947,14 +958,20 @@ function abortTrackedGenerationRequests() {
 function tryStopSillyTavernGeneration(options = {}) {
     const forceProbe = options?.forceProbe === true;
     const stopTrigger = findSillyTavernStopGenerationTrigger();
+    let nativeCalled = false;
+    // stopGeneration() returns true whenever SillyTavern's module-level abortController exists,
+    // which is always. Only whether the call threw tells us anything.
     if (typeof stopGeneration === "function" && (forceProbe || state.sillyTavernGenerationActive || hasRecentGenerationRecoveryWindow() || stopTrigger instanceof HTMLElement)) {
         try {
-            if (stopGeneration()) {
-                return "native";
-            }
+            stopGeneration();
+            nativeCalled = true;
         } catch {
             // Fall through to DOM/button and Escape based fallbacks.
         }
+    }
+
+    if (nativeCalled) {
+        return "native";
     }
 
     if (stopTrigger instanceof HTMLElement) {
@@ -964,6 +981,218 @@ function tryStopSillyTavernGeneration(options = {}) {
 
     dispatchEscapeStopGeneration();
     return "escape";
+}
+
+function getSillyTavernSwipeStateNone() {
+    const constants = state.sillyTavernSwipeConstants;
+    const noneState = constants?.SWIPE_STATE?.NONE;
+    return typeof noneState === "string" && noneState ? noneState : DEFAULT_SWIPE_STATE_NONE;
+}
+
+async function loadSillyTavernSwipeConstants() {
+    if (state.sillyTavernSwipeConstants !== undefined) {
+        return state.sillyTavernSwipeConstants;
+    }
+
+    try {
+        state.sillyTavernSwipeConstants = await import("../../../constants.js");
+    } catch {
+        state.sillyTavernSwipeConstants = null;
+    }
+
+    return state.sillyTavernSwipeConstants;
+}
+
+function readSillyTavernSwipeState() {
+    return typeof sillyTavernScript?.swipeState === "string" ? sillyTavernScript.swipeState : "";
+}
+
+function isSillyTavernSwipeStateStuck() {
+    const swipeState = readSillyTavernSwipeState();
+    return Boolean(swipeState) && swipeState !== getSillyTavernSwipeStateNone();
+}
+
+function isSillyTavernSendUiLocked() {
+    const bodyDataset = document.body?.dataset;
+    return Boolean(
+        bodyDataset?.generating === "true"
+        || bodyDataset?.swiping === "true"
+        || sillyTavernScript?.is_send_press === true
+        || isSillyTavernSwipeStateStuck(),
+    );
+}
+
+function waitForSillyTavernSendUiRecovery(timeoutMs) {
+    return new Promise((resolve) => {
+        const deadline = Date.now() + timeoutMs;
+        const check = () => {
+            if (!isSillyTavernSendUiLocked()) {
+                resolve(true);
+                return;
+            }
+
+            if (Date.now() >= deadline) {
+                resolve(false);
+                return;
+            }
+
+            setTimeout(check, SEND_UI_UNLOCK_POLL_INTERVAL_MS);
+        };
+
+        check();
+    });
+}
+
+function waitForSillyTavernSwipeStateRecovery(timeoutMs) {
+    return new Promise((resolve) => {
+        const deadline = Date.now() + timeoutMs;
+        const check = () => {
+            if (!isSillyTavernSwipeStateStuck()) {
+                resolve(true);
+                return;
+            }
+
+            if (Date.now() >= deadline) {
+                resolve(false);
+                return;
+            }
+
+            setTimeout(check, SEND_UI_UNLOCK_POLL_INTERVAL_MS);
+        };
+
+        check();
+    });
+}
+
+function forceReleaseSillyTavernSendButtons() {
+    if (typeof sillyTavernScript?.activateSendButtons === "function") {
+        try {
+            sillyTavernScript.activateSendButtons();
+            return true;
+        } catch {
+            // Fall through to the dataset-only downgrade below.
+        }
+    }
+
+    // Downgrade path: the CSS lock can be lifted without SillyTavern's helper, but is_send_press
+    // stays set, so the button becomes visible without becoming usable.
+    if (document.body?.dataset?.generating) {
+        delete document.body.dataset.generating;
+    }
+
+    return false;
+}
+
+function findSwipeStateResetTarget() {
+    const chatMessages = Array.isArray(sillyTavernScript?.chat) ? sillyTavernScript.chat : null;
+    if (!chatMessages || chatMessages.length === 0) {
+        return null;
+    }
+
+    const mesId = chatMessages.length - 1;
+    const message = chatMessages[mesId];
+    if (!message || !Array.isArray(message.swipes) || message.swipes.length === 0) {
+        return null;
+    }
+
+    const rawSwipeId = Number(message.swipe_id ?? 0);
+    const swipeId = Number.isFinite(rawSwipeId)
+        ? Math.min(Math.max(rawSwipeId, 0), message.swipes.length - 1)
+        : 0;
+
+    return { mesId, swipeId };
+}
+
+/**
+ * SillyTavern only resets its private swipeState at the tail of endSwipe(), and exposes no setter.
+ * Replaying an in-place swipe with a bypassing source is the only supported way back to NONE.
+ */
+async function resetSillyTavernSwipeState() {
+    if (!isSillyTavernSwipeStateStuck()) {
+        return true;
+    }
+
+    const constants = await loadSillyTavernSwipeConstants();
+    const source = constants?.SWIPE_SOURCE?.BACK;
+    const direction = constants?.SWIPE_DIRECTION?.RIGHT;
+    const swipeFn = sillyTavernScript?.swipe;
+    if (typeof swipeFn !== "function" || !source || !direction) {
+        return false;
+    }
+
+    const target = findSwipeStateResetTarget();
+    if (!target) {
+        return false;
+    }
+
+    try {
+        await swipeFn(null, direction, {
+            source,
+            repeated: false,
+            forceMesId: target.mesId,
+            forceSwipeId: target.swipeId,
+            forceDuration: 0,
+        });
+    } catch {
+        return false;
+    }
+
+    return !isSillyTavernSwipeStateStuck();
+}
+
+async function forceUnlockSillyTavernSendUi() {
+    await loadSillyTavernSwipeConstants();
+
+    if (await waitForSillyTavernSendUiRecovery(SEND_UI_UNLOCK_SELF_RECOVERY_MS)) {
+        return {
+            selfRecovered: true,
+            sendButtonsRestored: true,
+            swipeStateRecovered: true,
+            needsPageReload: false,
+        };
+    }
+
+    const sendButtonsRestored = forceReleaseSillyTavernSendButtons();
+    if (document.body?.dataset?.swiping) {
+        delete document.body.dataset.swiping;
+    }
+
+    const remainingGrace = Math.max(0, SWIPE_STATE_RESET_GRACE_MS - SEND_UI_UNLOCK_SELF_RECOVERY_MS);
+    const swipeStateSettled = await waitForSillyTavernSwipeStateRecovery(remainingGrace);
+    const swipeStateRecovered = swipeStateSettled || await resetSillyTavernSwipeState();
+
+    return {
+        selfRecovered: false,
+        sendButtonsRestored,
+        swipeStateRecovered,
+        needsPageReload: !sendButtonsRestored || !swipeStateRecovered,
+    };
+}
+
+function buildGenerationStopStatusText(stopResult, unlockResult, rescueMode) {
+    const parts = [];
+    if (stopResult.abortedRequestCount > 0) {
+        parts.push(`已发送终止指令，并强制切断 ${stopResult.abortedRequestCount} 条监控接管请求`);
+    } else if (rescueMode) {
+        parts.push("已按死锁救援模式补发终止指令");
+    } else {
+        parts.push("已发送终止指令");
+    }
+
+    if (unlockResult.selfRecovered) {
+        parts.push("酒馆已自行解除生成锁，发送按钮可用");
+        return parts.join("；");
+    }
+
+    if (!unlockResult.sendButtonsRestored) {
+        parts.push("读不到酒馆的解锁接口，只能清掉界面锁，发送按钮可能仍然点不动，需要刷新页面");
+        return parts.join("；");
+    }
+
+    parts.push(unlockResult.swipeStateRecovered
+        ? "已强制恢复发送按钮"
+        : "已强制恢复发送按钮，但滑动状态没能复位，左右滑动需要刷新页面才能恢复");
+    return parts.join("；");
 }
 
 function tryStopGenerationWithMonitorFallback(options = {}) {
@@ -982,7 +1211,7 @@ function tryStopGenerationWithMonitorFallback(options = {}) {
     };
 }
 
-function executeGenerationStopAction() {
+async function executeGenerationStopAction() {
     const manualForceStopMode = state.confirmDialog?.type === "manual-force-stop-generation"
         ? state.confirmDialog.mode
         : "";
@@ -994,18 +1223,23 @@ function executeGenerationStopAction() {
         clearPendingGenerationIntervention();
     }
     state.confirmDialog = null;
-    if (stopResult.abortedRequestCount > 0) {
-        state.apiStatus = `已尝试中止当前生成，并强制切断 ${stopResult.abortedRequestCount} 条监控接管请求`;
-    } else if (stopResult.stopMethod === "native") {
-        state.apiStatus = "已直接调用酒馆原生终止生成";
-    } else if (rescueMode) {
-        state.apiStatus = "未检测到明确活跃链路，已按死锁救援模式补发原生终止探测与中止指令";
-    } else {
-        state.apiStatus = stopResult.stopMethod === "click"
-            ? "已尝试中止当前生成"
-            : "已发送中止指令";
-    }
     state.apiError = "";
+    state.apiStatus = "已发送终止指令，正在确认发送按钮是否恢复…";
+    safeRenderPage();
+
+    let unlockResult;
+    try {
+        unlockResult = await forceUnlockSillyTavernSendUi();
+    } catch {
+        unlockResult = {
+            selfRecovered: false,
+            sendButtonsRestored: false,
+            swipeStateRecovered: false,
+            needsPageReload: true,
+        };
+    }
+
+    state.apiStatus = buildGenerationStopStatusText(stopResult, unlockResult, rescueMode);
     safeRenderPage();
 }
 
@@ -7069,7 +7303,7 @@ function handlePanelAction(actionTarget, event) {
     }
 
     if (action === "confirm-generation-intervention-yes") {
-        executeGenerationStopAction();
+        void executeGenerationStopAction();
         return true;
     }
 
@@ -7086,7 +7320,7 @@ function handlePanelAction(actionTarget, event) {
     }
 
     if (action === "confirm-manual-force-stop-yes") {
-        executeGenerationStopAction();
+        void executeGenerationStopAction();
         return true;
     }
 
