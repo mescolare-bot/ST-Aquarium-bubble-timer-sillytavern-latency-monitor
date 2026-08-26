@@ -71,6 +71,19 @@ function filterRunsByChatKey(runs, chatKey = '') {
     return runs.filter((run) => normalizeOptionalText(run?.request_chat_key, 200) === chatKey);
 }
 
+function readRequestedFlag(value) {
+    const text = String(value ?? '').trim().toLowerCase();
+    return text === '1' || text === 'true' || text === 'yes';
+}
+
+function filterRunsByAbnormal(runs, abnormalOnly = false) {
+    if (!abnormalOnly) {
+        return runs;
+    }
+
+    return runs.filter((run) => isAbnormalRun(run));
+}
+
 async function readRunEntries() {
     try {
         const content = await fs.readFile(LOG_FILE, 'utf8');
@@ -822,8 +835,12 @@ export async function init(router) {
         const offset = Math.max(0, Number(req.query.offset) || 0);
         const requestedPurpose = readRequestedPurpose(req.query.request_purpose);
         const requestedChatKey = readRequestedChatKey(req.query.request_chat_key);
+        const abnormalOnly = readRequestedFlag(req.query.abnormal_only);
         const allRuns = await readRuns(1000000, 0);
-        const filteredRuns = filterRunsByChatKey(filterRunsByPurpose(allRuns, requestedPurpose), requestedChatKey);
+        const filteredRuns = filterRunsByAbnormal(
+            filterRunsByChatKey(filterRunsByPurpose(allRuns, requestedPurpose), requestedChatKey),
+            abnormalOnly,
+        );
         const total = filteredRuns.length;
         const runs = filteredRuns.slice(offset, offset + limit);
         res.json({
@@ -834,6 +851,7 @@ export async function init(router) {
             offset,
             request_purpose: requestedPurpose || null,
             request_chat_key: requestedChatKey || null,
+            abnormal_only: abnormalOnly,
             runs,
         });
     });

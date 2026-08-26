@@ -2598,6 +2598,15 @@ function filterRunsByCacheHit(runs, cacheHitOnly = state.uiSettings.cacheHitOnly
     return list.filter(hasRunCacheHit);
 }
 
+function filterRunsByAbnormal(runs, abnormalOnly = false) {
+    const list = Array.isArray(runs) ? runs : [];
+    if (!abnormalOnly) {
+        return list;
+    }
+
+    return list.filter(isAbnormalRun);
+}
+
 function normalizePluginKey(value) {
     return typeof value === "string" && value.trim()
         ? value.trim().toLowerCase()
@@ -5113,12 +5122,13 @@ async function fetchAllStoredRuns() {
 
 async function fetchAbnormalStoredRuns() {
     const fetchLimit = Math.max(
-        HISTORY_PREVIEW_COUNT,
+        Number(state.historyTotal) || 0,
+        Number(state.status?.stored_runs) || 0,
         state.recentAbnormalRuns.length,
         HISTORY_PAGE_SIZE,
     );
     const result = await fetchJson(`/runs?limit=${fetchLimit}&offset=0&${buildRunFilterQuery({ abnormalOnly: true })}`);
-    const runs = filterRunsByRequestPurpose(result?.runs);
+    const runs = filterRunsByAbnormal(filterRunsByRequestPurpose(result?.runs), true);
     const total = Math.max(Number(result?.total) || 0, runs.length);
     return { runs, total };
 }
@@ -6459,7 +6469,9 @@ function buildRunHtml(run, { compactSummary = false, showWaitingQueueAction = tr
 function renderRuns() {
     const currentChatName = getTrackedCurrentChatWindowName();
     const scopedRuns = filterRunsByCacheHit(filterRunsByRequestPurpose(state.runs));
-    const scopedAbnormalRuns = filterRunsByCacheHit(filterRunsByRequestPurpose(state.recentAbnormalRuns));
+    const scopedAbnormalRuns = filterRunsByCacheHit(
+        filterRunsByAbnormal(filterRunsByRequestPurpose(state.recentAbnormalRuns), true),
+    );
 
     if (!scopedRuns.length && !state.uiSettings.abnormalOnly) {
         return '<div class="stlp-empty">当前还没有后台监控记录。发送一轮消息后，这里会显示最近 20 条生成详情。</div>';
@@ -7146,6 +7158,10 @@ function handlePanelChangeTarget(target) {
         state.uiSettings.abnormalOnly = Boolean(target.checked);
         saveUiSettings();
         if (state.uiSettings.abnormalOnly) {
+            const localAbnormalRuns = filterRunsByAbnormal(state.runs, true);
+            if (localAbnormalRuns.length && !state.recentAbnormalRuns.length) {
+                state.recentAbnormalRuns = sortRunsByStartedAtDesc(localAbnormalRuns);
+            }
             void loadRecentAbnormalRuns();
         } else {
             safeRenderPage();
