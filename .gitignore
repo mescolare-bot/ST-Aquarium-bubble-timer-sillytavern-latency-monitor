@@ -13,10 +13,17 @@ Thumbs.db
 .env
 .env.*
 
-# Remote patch scripts with embedded credentials
+# Remote patch / probe scripts with embedded credentials
 backend-monitor-minimal/install-remote.mjs
+backend-monitor-minimal/inspect-remote-menu.mjs
 backend-monitor-minimal/patch-generate-route-remote.mjs
 backend-monitor-minimal/patch-prompt-trace-remote.mjs
 backend-monitor-minimal/patch-prompt-trace-ui-remote.mjs
 backend-monitor-minimal/fix-counter-helper-scope-remote.mjs
 backend-monitor-minimal/optimize-latest-reply-counter-remote.mjs
+
+# Local-only working material (not part of the delivered extension)
+.dbg/
+backend-monitor-minimal/remote-src/
+external_refs/
+*_preview.svg
