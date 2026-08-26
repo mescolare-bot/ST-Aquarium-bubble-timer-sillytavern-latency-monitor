@@ -1,0 +1,55 @@
+diff --git a/app/message-sender.js b/app/message-sender.js
+index 1111111..<SSH_PORT>22 100644
+--- a/app/message-sender.js
++++ b/app/message-sender.js
+@@
+     setCurrentChat(friendId, friendName, isGroup = false) {
+       this.currentFriendId = friendId;
+       this.currentFriendName = friendName;
+       this.isGroup = isGroup;
+@@
+       });
+     }
+ 
++    reportInjectionSource() {
++      try {
++        window.STLatencyMonitorInjectionSource?.reportInjectionSource({
++          source: 'abstract-external-phone',
++          label: 'Abstract外置手机',
++        });
++      } catch (error) {
++        console.warn('[Message Sender] 注入来源上报失败:', error);
++      }
++    }
++
+     /**
+      * 发送消息到SillyTavern
+      * 参考qq-app.js的sendToChat方法
+      */
+     async sendToChat(message) {
+@@
+         if (sendButton.classList.contains('disabled')) {
+           console.warn('[Message Sender] 发送按钮被禁用');
+           return false;
+         }
+ 
++        this.reportInjectionSource();
++
+         // 追加消息到现有内容
+         const existingValue = originalInput.value;
+         const newValue = existingValue ? existingValue + '\n' + message : message;
+         originalInput.value = newValue;
+         console.log('[Message Sender] 已追加消息到输入框:', {
+@@
+         const textareas = document.querySelectorAll('textarea');
+         const inputs = document.querySelectorAll('input[type="text"]');
+ 
+         if (textareas.length > 0) {
+           const textarea = textareas[0];
++          this.reportInjectionSource();
+           textarea.value = message;
+           textarea.focus();
+ 
+           // 模拟键盘事件
+           textarea.dispatchEvent(new Event('input', { bubbles: true }));
+ 
