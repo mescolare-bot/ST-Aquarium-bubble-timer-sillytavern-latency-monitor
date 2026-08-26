@@ -1813,6 +1813,23 @@ body.stlp-page-host-open {
     box-shadow: 0 0 0 2px color-mix(in srgb, var(--stlp-toolbar-accent-border, var(--stlp-control-border)) 62%, transparent), inset 0 1px 0 rgba(255, 255, 255, 0.18);
 }
 
+/* 该天数已经超出当前口径的实际数据范围，选它和选更小的天数结果完全一样。 */
+.stlp-daily-summary-filter.is-beyond-range:not(.is-active) {
+    border-style: dashed;
+    opacity: 0.5;
+    filter: saturate(0.45);
+}
+
+.stlp-daily-summary-filter.is-beyond-range:not(.is-active):hover {
+    opacity: 0.7;
+    filter: saturate(0.6);
+}
+
+.stlp-daily-summary-range-note {
+    margin-top: -4px;
+    margin-bottom: 12px;
+}
+
 .stlp-daily-summary-list {
     display: flex;
     flex-direction: column;

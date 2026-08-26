@@ -23,6 +23,11 @@ const LOG_FILE = path.join(LOG_DIR, 'runs.jsonl');
 const WAITING_QUEUE_FILE = path.join(LOG_DIR, 'waiting-queue.json');
 const PLUGIN_RULE_CANDIDATES_FILE = path.join(LOG_DIR, 'plugin-rule-candidates.jsonl');
 
+// 剥掉 prompt_breakdown 之后单条 run 约 1.5KB，这里仍然保留上限：
+// 全量 5000+ 条一次返回依然是好几 MB，没有任何视图需要这么多。
+// 筛选已经下沉到服务端，命中筛选后的结果集远小于这个上限。
+const MAX_RUNS_PAGE_LIMIT = 2000;
+
 function normalizeOptionalText(value) {
     return typeof value === 'string' && value.trim()
         ? value.trim()
@@ -82,6 +87,37 @@ function filterRunsByAbnormal(runs, abnormalOnly = false) {
     }
 
     return runs.filter((run) => isAbnormalRun(run));
+}
+
+function filterRunsByCacheHit(runs, cacheHitOnly = false) {
+    if (!cacheHitOnly) {
+        return runs;
+    }
+
+    return runs.filter((run) => getRunUsage(run).cacheHit);
+}
+
+// prompt_breakdown 平均 4.6KB，占单条 run 体积的 74.8%，而前端目前不读它。
+// 默认不下发可以把列表响应缩小到约四分之一；需要时用 include_prompt_breakdown=1 显式取回。
+function toClientRun(run, includePromptBreakdown = false) {
+    if (!run || typeof run !== 'object' || includePromptBreakdown) {
+        return run;
+    }
+
+    if (run.prompt_breakdown === undefined) {
+        return run;
+    }
+
+    const { prompt_breakdown: _promptBreakdown, ...rest } = run;
+    return rest;
+}
+
+function toClientRuns(runs, includePromptBreakdown = false) {
+    if (includePromptBreakdown) {
+        return runs;
+    }
+
+    return runs.map((run) => toClientRun(run, false));
 }
 
 async function readRunEntries() {
@@ -325,7 +361,7 @@ async function readWaitingQueueRuns() {
 
     return queueEntries.map((entry) => ({
         ...entry,
-        run: runMap.get(entry.run_id) ?? null,
+        run: toClientRun(runMap.get(entry.run_id) ?? null),
     }));
 }
 
@@ -670,15 +706,24 @@ function buildDailySummary(runs, days = 14) {
 
     const dayBuckets = new Map();
     const filteredRuns = [];
+    // 当前口径（已按用途/聊天筛过，但未按天数截断）的真实数据范围。
+    // 聊天口径下 request_chat_key 是后加的字段，老记录没有，所以可选天数经常远超实际能覆盖的范围，
+    // 前端需要这两个值才能说清楚"再往前没有记录"，而不是让人以为切换天数坏了。
+    const scopeDateKeys = new Set();
+    let scopeEarliestDateKey = '';
 
     for (const run of runs) {
         const runDate = getRunDate(run);
-        if (!runDate || runDate < cutoff) {
-            continue;
+        const dateKey = getRunDateKey(run);
+
+        if (runDate && dateKey) {
+            scopeDateKeys.add(dateKey);
+            if (!scopeEarliestDateKey || dateKey < scopeEarliestDateKey) {
+                scopeEarliestDateKey = dateKey;
+            }
         }
 
-        const dateKey = getRunDateKey(run);
-        if (!dateKey) {
+        if (!runDate || runDate < cutoff || !dateKey) {
             continue;
         }
 
@@ -774,6 +819,8 @@ function buildDailySummary(runs, days = 14) {
         days: normalizedDays,
         summary: buildSummary(filteredRuns),
         rows,
+        scope_earliest_date_key: scopeEarliestDateKey || null,
+        scope_total_days: scopeDateKeys.size,
     };
 }
 
@@ -831,27 +878,35 @@ export async function init(router) {
     });
 
     router.get('/runs', async (req, res) => {
-        const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 50));
+        const limit = Math.max(1, Math.min(MAX_RUNS_PAGE_LIMIT, Number(req.query.limit) || 50));
         const offset = Math.max(0, Number(req.query.offset) || 0);
         const requestedPurpose = readRequestedPurpose(req.query.request_purpose);
         const requestedChatKey = readRequestedChatKey(req.query.request_chat_key);
         const abnormalOnly = readRequestedFlag(req.query.abnormal_only);
+        const cacheHitOnly = readRequestedFlag(req.query.cache_hit);
+        const includePromptBreakdown = readRequestedFlag(req.query.include_prompt_breakdown);
         const allRuns = await readRuns(1000000, 0);
-        const filteredRuns = filterRunsByAbnormal(
-            filterRunsByChatKey(filterRunsByPurpose(allRuns, requestedPurpose), requestedChatKey),
-            abnormalOnly,
+        const filteredRuns = filterRunsByCacheHit(
+            filterRunsByAbnormal(
+                filterRunsByChatKey(filterRunsByPurpose(allRuns, requestedPurpose), requestedChatKey),
+                abnormalOnly,
+            ),
+            cacheHitOnly,
         );
         const total = filteredRuns.length;
-        const runs = filteredRuns.slice(offset, offset + limit);
+        const runs = toClientRuns(filteredRuns.slice(offset, offset + limit), includePromptBreakdown);
         res.json({
             ok: true,
             total,
             count: runs.length,
             limit,
+            max_limit: MAX_RUNS_PAGE_LIMIT,
             offset,
             request_purpose: requestedPurpose || null,
             request_chat_key: requestedChatKey || null,
             abnormal_only: abnormalOnly,
+            cache_hit: cacheHitOnly,
+            include_prompt_breakdown: includePromptBreakdown,
             runs,
         });
     });
@@ -876,6 +931,7 @@ export async function init(router) {
         }
     });
 
+    // 单条详情按需返回完整 run，包含列表接口已经剥掉的 prompt_breakdown。
     router.get('/runs/:id', async (req, res) => {
         const run = await readRunById(req.params.id);
         if (!run) {
@@ -1090,7 +1146,7 @@ export async function init(router) {
 
             res.json({
                 ok: true,
-                run: updatedRun,
+                run: toClientRun(updatedRun),
                 queue_entry: null,
                 removed_from_waiting_queue: true,
                 learned_rule_created: Boolean(savedLearnedRule),

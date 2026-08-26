@@ -47,8 +47,26 @@ const DEFAULT_OUTPUT_CARD_FIELDS = {
     showInjectionDetails: false,
     showPricingDetails: false,
     showContextVolume: false,
+    showPromptVolume: false,
     showExtensionDetails: false,
     maskChatTitle: false,
+};
+
+const PROMPT_VOLUME_TOP_MESSAGE_COUNT = 5;
+const PROMPT_VOLUME_SINGLE_MESSAGE_DOMINANT_RATIO = 0.4;
+const PROMPT_VOLUME_ROLE_DOMINANT_RATIO = 0.5;
+const PROMPT_VOLUME_HISTORY_DOMINANT_RATIO = 0.6;
+const PROMPT_VOLUME_HISTORY_MESSAGE_THRESHOLD = 20;
+// 单条明细约 4.6KB，缓存要设上限，否则翻久了历史会一直涨。
+const PROMPT_VOLUME_CACHE_LIMIT = 50;
+
+const PROMPT_ROLE_LABELS = {
+    system: "系统提示",
+    user: "用户",
+    assistant: "助手",
+    tool: "工具",
+    function: "函数",
+    unknown: "未知角色",
 };
 
 const DEFAULT_SETTINGS_SUBSECTION_OPEN_STATES = {
@@ -310,6 +328,9 @@ const state = {
     activeGenerationRequests: new Map(),
     sillyTavernGenerationActive: false,
     sillyTavernGenerationRecoveryUntil: 0,
+    // 随请求体一起发给后端的本次生成标识。后端只在请求结束后才落盘 run，
+    // 列表里永远看不到"正在跑"的那次，只能靠这个 id 判断一条异常记录是不是当前这次生成。
+    currentGenerationClientId: "",
     sillyTavernSwipeConstants: undefined,
     pendingInjectionSource: null,
     chatWindowContext: {
@@ -354,8 +375,13 @@ const state = {
     historyLoading: false,
     historyError: "",
     historyScrollTop: 0,
-    recentAbnormalRuns: [],
-    recentAbnormalLoading: false,
+    filteredRuns: [],
+    filteredRunsKey: "",
+    filteredRunsPendingKey: "",
+    filteredRunsLoading: false,
+    // /runs 列表不再下发 prompt_breakdown，展开详情时才按 run 单独取回来。
+    promptBreakdownByRunId: {},
+    promptBreakdownLoadingRunIds: new Set(),
     waitingQueueEntries: [],
     waitingQueueLoading: false,
     waitingQueueError: "",
@@ -629,44 +655,31 @@ function findSillyTavernStopGenerationTrigger() {
         "#mes_stop",
         "#stop_generation",
         "#stopGenerate",
-        '[aria-label*="stop" i]',
-        '[title*="stop" i]',
-        '[aria-label*="abort" i]',
-        '[title*="abort" i]',
     ]);
     if (directMatch && !isMonitorRootElement(directMatch)) {
         return directMatch;
     }
 
-    const candidates = Array.from(document.querySelectorAll("button, .menu_button, [role='button'], .interactable"));
-    return candidates.find((candidate) => {
-        // The monitor's own "终止生成" button matches the keyword scan through its id, so it must
-        // never be treated as SillyTavern's stop control.
-        if (!(candidate instanceof HTMLElement) || isMonitorRootElement(candidate) || !isVisibleElement(candidate)) {
-            return false;
-        }
-
-        const text = [
-            candidate.textContent,
-            candidate.getAttribute("aria-label"),
-            candidate.getAttribute("title"),
-            candidate.id,
-            candidate.className,
-        ].join(" ");
-
-        return /(停止|中止|stop|abort)/i.test(text);
-    }) ?? null;
+    return null;
 }
 
 function hasRecentGenerationRecoveryWindow() {
     return Date.now() < Number(state.sillyTavernGenerationRecoveryUntil || 0);
 }
 
+function isSillyTavernGenerationInProgress() {
+    return Boolean(
+        document.body?.dataset?.generating === "true"
+        || findSillyTavernStopGenerationTrigger()
+        || hasAbortableGenerationRequest()
+    );
+}
+
 function isSillyTavernGenerationLikelyActive() {
     return Boolean(
         state.sillyTavernGenerationActive
         || hasRecentGenerationRecoveryWindow()
-        || findSillyTavernStopGenerationTrigger(),
+        || isSillyTavernGenerationInProgress()
     );
 }
 
@@ -678,11 +691,26 @@ function markSillyTavernGenerationStarted() {
 function markSillyTavernGenerationStopped() {
     state.sillyTavernGenerationActive = false;
     state.sillyTavernGenerationRecoveryUntil = Date.now() + GENERATION_RECOVERY_WINDOW_MS;
+    state.currentGenerationClientId = "";
 }
 
 function markSillyTavernGenerationEnded() {
     state.sillyTavernGenerationActive = false;
     state.sillyTavernGenerationRecoveryUntil = 0;
+    state.currentGenerationClientId = "";
+}
+
+// crypto.randomUUID 只在安全上下文可用，而酒馆常常是 http 直连，这里必须自带兜底。
+function createClientGenerationId() {
+    try {
+        if (typeof crypto?.randomUUID === "function") {
+            return crypto.randomUUID();
+        }
+    } catch {
+        // 落到下面的兜底实现
+    }
+
+    return `gen-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function buildGenerationInterventionKey(kind, suffix = "") {
@@ -1258,6 +1286,20 @@ function getLatestAbnormalRunId(runs) {
     return typeof abnormalRun?.id === "string" ? abnormalRun.id : "";
 }
 
+// 后端只在请求结束后才把 run 落盘，所以列表里出现的异常记录默认都属于"已经结束的某一次生成"。
+// 光看"有新异常 + 现在正在生成"会把上一次的异常安到当前这次头上：
+// 实测过一例，异常记录 16:30:22 就结束了，而当时正在跑的那次 16:31:37 才开始，两者毫无关系。
+// 所以必须靠随请求体下发的生成 id 精确比对。
+// 真正该弹的场景是：后端说这次生成已经异常结束，而酒馆 UI 还卡在生成中（停止键不消失）。
+function isRunForCurrentGeneration(run) {
+    const currentGenerationClientId = state.currentGenerationClientId;
+    if (!currentGenerationClientId) {
+        return false;
+    }
+
+    return run?.request_client_generation_id === currentGenerationClientId;
+}
+
 function updateMinimizedButtonAbnormalAlert(runs) {
     const sortedRuns = sortRunsByStartedAtDesc(Array.isArray(runs) ? runs : []);
     const latestAbnormalRun = sortedRuns.find((run) => isAbnormalRun(run)) ?? null;
@@ -1274,7 +1316,9 @@ function updateMinimizedButtonAbnormalAlert(runs) {
 
     state.lastSeenAbnormalRunId = latestAbnormalRunId;
     const abnormalType = latestAbnormalRun?.abnormal_detail?.abnormal_type;
-    if (ACTIONABLE_ABNORMAL_TYPES.has(abnormalType) && isSillyTavernGenerationLikelyActive()) {
+    if (ACTIONABLE_ABNORMAL_TYPES.has(abnormalType)
+        && isSillyTavernGenerationInProgress()
+        && isRunForCurrentGeneration(latestAbnormalRun)) {
         queueGenerationInterventionAlert({
             kind: "abnormal-generation",
             title: "这次生成大概率不会正常返回",
@@ -1440,7 +1484,9 @@ function getRequestPluginMatchModeLabel(value) {
     return REQUEST_PLUGIN_MATCH_MODE_LABELS[value] || REQUEST_PLUGIN_MATCH_MODE_LABELS.none;
 }
 
-function buildRunFilterQuery({ abnormalOnly = false, cacheHitOnly = state.uiSettings.cacheHitOnly } = {}) {
+// 筛选必须显式传入。默认关闭可以保证主刷新和汇总接口始终拿到未筛选的全局口径，
+// 否则勾一个筛选就会把 summary 的统计范围一起改掉。
+function buildRunFilterQuery({ abnormalOnly = false, cacheHitOnly = false } = {}) {
     const params = new URLSearchParams();
     params.set("request_purpose", getActiveRequestPurpose());
     if (abnormalOnly) {
@@ -2414,7 +2460,7 @@ function collectPricingModels() {
         ...state.runs,
         ...state.historyRuns,
         ...state.historyAllRuns,
-        ...state.recentAbnormalRuns,
+        ...state.filteredRuns,
     ];
 
     for (const run of allRuns) {
@@ -2589,7 +2635,7 @@ function getRunAbnormalBilling(run) {
     };
 }
 
-function filterRunsByCacheHit(runs, cacheHitOnly = state.uiSettings.cacheHitOnly) {
+function filterRunsByCacheHit(runs, cacheHitOnly = false) {
     const list = Array.isArray(runs) ? runs : [];
     if (!cacheHitOnly) {
         return list;
@@ -2605,6 +2651,44 @@ function filterRunsByAbnormal(runs, abnormalOnly = false) {
     }
 
     return list.filter(isAbnormalRun);
+}
+
+function getActiveRunFilters() {
+    return {
+        abnormalOnly: Boolean(state.uiSettings.abnormalOnly),
+        cacheHitOnly: Boolean(state.uiSettings.cacheHitOnly),
+    };
+}
+
+function hasActiveRunFilters(filters = getActiveRunFilters()) {
+    return Boolean(filters.abnormalOnly || filters.cacheHitOnly);
+}
+
+// 数据槽是否可用要连筛选组合一起比对，否则切换筛选后会短暂显示上一次筛选的结果。
+function buildRunFilterKey(filters = getActiveRunFilters()) {
+    return [
+        getActiveRequestPurpose(),
+        filters.abnormalOnly ? "abnormal" : "",
+        filters.cacheHitOnly ? "cache-hit" : "",
+    ].join("|");
+}
+
+function applyRunFilters(runs, filters = getActiveRunFilters()) {
+    return filterRunsByCacheHit(
+        filterRunsByAbnormal(filterRunsByRequestPurpose(runs), filters.abnormalOnly),
+        filters.cacheHitOnly,
+    );
+}
+
+function getRunFilterLabel(filters = getActiveRunFilters()) {
+    const labels = [];
+    if (filters.abnormalOnly) {
+        labels.push("只看异常");
+    }
+    if (filters.cacheHitOnly) {
+        labels.push("只看缓存命中");
+    }
+    return labels.join(" + ");
 }
 
 function normalizePluginKey(value) {
@@ -2769,7 +2853,7 @@ function findRunById(runId) {
         ...state.runs,
         ...state.historyRuns,
         ...state.historyAllRuns,
-        ...state.recentAbnormalRuns,
+        ...state.filteredRuns,
         ...state.waitingQueueEntries.map((entry) => entry?.run).filter(Boolean),
     ];
 
@@ -2934,6 +3018,159 @@ function maskOutputCardChatTitle(value) {
     return Array.from(value).map((char) => (/\s/.test(char) ? char : "□")).join("");
 }
 
+function getPromptRoleLabel(role) {
+    const key = typeof role === "string" && role.trim() ? role.trim() : "unknown";
+    return PROMPT_ROLE_LABELS[key] || key;
+}
+
+function getRunPromptBreakdown(run) {
+    const runId = run?.id;
+    if (run?.prompt_breakdown) {
+        return run.prompt_breakdown;
+    }
+    return runId ? (state.promptBreakdownByRunId[runId] ?? null) : null;
+}
+
+function isPromptBreakdownLoading(runId) {
+    return Boolean(runId) && state.promptBreakdownLoadingRunIds.has(runId);
+}
+
+function hasLoadedPromptBreakdown(runId) {
+    return Boolean(runId) && Object.prototype.hasOwnProperty.call(state.promptBreakdownByRunId, runId);
+}
+
+function cachePromptBreakdown(runId, breakdown) {
+    if (!runId) {
+        return;
+    }
+
+    const cache = state.promptBreakdownByRunId;
+    if (!Object.prototype.hasOwnProperty.call(cache, runId)) {
+        const cachedIds = Object.keys(cache);
+        if (cachedIds.length >= PROMPT_VOLUME_CACHE_LIMIT) {
+            delete cache[cachedIds[0]];
+        }
+    }
+    cache[runId] = breakdown ?? null;
+}
+
+// 后端不再落盘 top_messages / recent_messages，这里从 message_sizes 现算，结果与旧字段一致。
+function buildPromptVolumeInsight(breakdown) {
+    if (!breakdown || typeof breakdown !== "object") {
+        return null;
+    }
+
+    const totalChars = Number(breakdown.total_chars) || 0;
+    const totalMessages = Number(breakdown.total_messages) || 0;
+    const messageSizes = Array.isArray(breakdown.message_sizes) ? breakdown.message_sizes : [];
+    const rawRoleTotals = breakdown.role_totals && typeof breakdown.role_totals === "object"
+        ? breakdown.role_totals
+        : {};
+
+    const roleRows = Object.entries(rawRoleTotals)
+        .map(([role, stat]) => ({
+            role,
+            label: getPromptRoleLabel(role),
+            count: Number(stat?.count) || 0,
+            chars: Number(stat?.chars) || 0,
+            share: totalChars ? ((Number(stat?.chars) || 0) / totalChars) * 100 : 0,
+        }))
+        .sort((left, right) => right.chars - left.chars);
+
+    const topMessages = [...messageSizes]
+        .sort((left, right) => (Number(right?.chars) || 0) - (Number(left?.chars) || 0))
+        .slice(0, PROMPT_VOLUME_TOP_MESSAGE_COUNT)
+        .map((message) => ({
+            index: Number(message?.index) || 0,
+            label: getPromptRoleLabel(message?.role),
+            chars: Number(message?.chars) || 0,
+            share: totalChars ? ((Number(message?.chars) || 0) / totalChars) * 100 : 0,
+        }));
+
+    const largestMessage = topMessages[0] ?? null;
+    const dominantRole = roleRows[0] ?? null;
+    const historyChars = roleRows
+        .filter((row) => row.role === "user" || row.role === "assistant")
+        .reduce((sum, row) => sum + row.chars, 0);
+    const historyShare = totalChars ? (historyChars / totalChars) * 100 : 0;
+
+    let conclusion;
+    if (!totalChars) {
+        conclusion = "这条记录没有拿到可用的提示词体积数据。";
+    } else if (largestMessage && largestMessage.share >= PROMPT_VOLUME_SINGLE_MESSAGE_DOMINANT_RATIO * 100) {
+        conclusion = `单条消息偏大：第 ${largestMessage.index + 1} 条（${largestMessage.label}）就占了提示词的 ${formatPercent(largestMessage.share)}，优先检查这一条。`;
+    } else if (dominantRole?.role === "system" && dominantRole.share >= PROMPT_VOLUME_ROLE_DOMINANT_RATIO * 100) {
+        conclusion = `系统提示词占大头：${formatPercent(dominantRole.share)} 的提示词体积来自系统提示，先精简预设和世界书。`;
+    } else if (historyShare >= PROMPT_VOLUME_HISTORY_DOMINANT_RATIO * 100 && totalMessages >= PROMPT_VOLUME_HISTORY_MESSAGE_THRESHOLD) {
+        conclusion = `历史对话累积偏长：${totalMessages} 条消息里的对话正文占 ${formatPercent(historyShare)}，考虑压缩上下文或开总结。`;
+    } else {
+        conclusion = `体积分布相对均衡，暂时没有明显的单点拖累（共 ${totalMessages} 条消息、${formatCount(totalChars)} 字符）。`;
+    }
+
+    const compositionText = roleRows.length
+        ? roleRows.map((row) => `${row.label} ${formatCount(row.chars)} 字符（${formatPercent(row.share)}）`).join("，")
+        : "-";
+
+    return {
+        totalChars,
+        totalMessages,
+        roleRows,
+        topMessages,
+        largestMessage,
+        historyShare,
+        conclusion,
+        compositionText,
+    };
+}
+
+function buildPromptVolumeRows(insight) {
+    if (!insight) {
+        return [];
+    }
+
+    const rows = [
+        { label: "消息总数", value: formatCount(insight.totalMessages) },
+        { label: "提示词字符", value: formatCount(insight.totalChars) },
+    ];
+
+    for (const row of insight.roleRows) {
+        rows.push({
+            label: row.label,
+            value: `${formatCount(row.count)} 条 · ${formatCount(row.chars)} 字符（${formatPercent(row.share)}）`,
+            full: true,
+        });
+    }
+
+    if (insight.largestMessage) {
+        rows.push({
+            label: "最大单条",
+            value: `第 ${insight.largestMessage.index + 1} 条 · ${insight.largestMessage.label} · ${formatCount(insight.largestMessage.chars)} 字符（${formatPercent(insight.largestMessage.share)}）`,
+            full: true,
+        });
+    }
+
+    return rows;
+}
+
+function renderPromptVolumeSection(run) {
+    const runId = run?.id;
+    const insight = buildPromptVolumeInsight(getRunPromptBreakdown(run));
+
+    if (insight) {
+        return renderHistoryDetailSection("提示词体积分布", buildPromptVolumeRows(insight), insight.conclusion);
+    }
+
+    if (isPromptBreakdownLoading(runId)) {
+        return renderHistoryDetailSection("提示词体积分布", [], "正在读取这条记录的提示词体积明细...");
+    }
+
+    if (hasLoadedPromptBreakdown(runId)) {
+        return renderHistoryDetailSection("提示词体积分布", [], "这条记录没有提示词体积明细，可能是更早版本写入的记录。");
+    }
+
+    return "";
+}
+
 function buildOutputCardSectionData(snapshot, fields) {
     return {
         coreRows: [
@@ -2988,6 +3225,9 @@ function buildOutputCardSectionData(snapshot, fields) {
             { label: "缓存读取", value: snapshot.cacheReadTokensText },
             { label: "预估价格", value: snapshot.estimatedPriceText },
         ] : [],
+        promptVolumeRows: fields.showPromptVolume && snapshot.promptVolume
+            ? buildPromptVolumeRows(snapshot.promptVolume)
+            : [],
     };
 }
 
@@ -2995,6 +3235,7 @@ const HISTORY_RUN_DETAIL_FIELDS = Object.freeze({
     showInjectionDetails: true,
     showPricingDetails: true,
     showContextVolume: true,
+    showPromptVolume: true,
     showExtensionDetails: true,
     maskChatTitle: false,
 });
@@ -3105,8 +3346,12 @@ function getOutputCardSnapshot(run, fieldsOverride = null) {
     const paymentCompletionText = abnormalBilling
         ? abnormalBilling.paidText
         : (usageAvailable || estimatedPrice ? "已完成" : "未确认");
+    const promptVolume = buildPromptVolumeInsight(getRunPromptBreakdown(run));
 
     return {
+        promptVolume,
+        promptVolumeConclusionText: promptVolume?.conclusion || "-",
+        promptVolumeCompositionText: promptVolume?.compositionText || "-",
         title: getOutputCardPrimaryTitle(run, chatName),
         summaryLabel: isAbnormalRun(run) ? getAbnormalTypeLabel(abnormalType) : "正常完成",
         requestPurposeLabel: getRequestPurposeLabel(run?.request_purpose),
@@ -3197,6 +3442,8 @@ function buildOutputCardText(run) {
         `拓展名称：${snapshot.pluginLabel}`,
         fields.showContextVolume ? `消息数：${snapshot.messageCountText}` : "",
         fields.showContextVolume ? `提示词字符数：${snapshot.promptCharsText}` : "",
+        fields.showPromptVolume ? `提示词体积结论：${snapshot.promptVolumeConclusionText}` : "",
+        fields.showPromptVolume ? `提示词体积构成：${snapshot.promptVolumeCompositionText}` : "",
         fields.showInjectionDetails ? `注入来源名称：${snapshot.injectionSourceLabel}` : "",
         fields.showInjectionDetails ? `注入来源标识：${snapshot.injectionSourceId}` : "",
         fields.showInjectionDetails ? `提示词来源：${snapshot.traceLabelsText}` : "",
@@ -3346,6 +3593,20 @@ function readCurrentChatIdentity() {
         chatIdHash,
         chatName,
     };
+}
+
+// 楼层只存在于 ST 前端的聊天数组里，代理侧看不到，所以必须在发起生成的那一刻就地读取。
+// 返回值是"这次生成产出的消息最终会落在哪个下标"，与 .mesIDDisplay 显示的 #N 同口径（0 基）。
+function readCurrentGenerationFloor() {
+    const chat = getSillyTavernContext()?.chat;
+    if (!Array.isArray(chat) || !chat.length) {
+        return null;
+    }
+
+    // 新回复追加在末尾；重roll/swipe 时末尾已经是待替换的 AI 消息，楼层要往回退一格。
+    const lastMessage = chat[chat.length - 1];
+    const isRegeneration = Boolean(lastMessage && typeof lastMessage === "object" && !lastMessage.is_user);
+    return isRegeneration ? chat.length - 1 : chat.length;
 }
 
 function detectChatWindowContext() {
@@ -3753,6 +4014,15 @@ function syncRunChatMap() {
 }
 
 function getRunFloorLabel(run) {
+    // 新记录在发起生成时就把楼层随请求体落盘了，直接读即可，不依赖本地映射表。
+    // 旧记录没有这个字段，回落到早期靠 DOM 抓取攒下来的 runFloorMap。
+    if (run?.request_floor != null) {
+        const storedFloor = Number(run.request_floor);
+        if (Number.isInteger(storedFloor) && storedFloor >= 0) {
+            return `#${storedFloor}`;
+        }
+    }
+
     if (!run?.id) {
         return "";
     }
@@ -4562,7 +4832,7 @@ async function submitWaitingQueueLabel(runId) {
         state.runs = state.runs.map(replaceRun);
         state.historyRuns = state.historyRuns.map(replaceRun);
         state.historyAllRuns = state.historyAllRuns.map(replaceRun);
-        state.recentAbnormalRuns = state.recentAbnormalRuns.map(replaceRun);
+        state.filteredRuns = state.filteredRuns.map(replaceRun);
     }
 
     const matchedRuns = Number.isFinite(Number(result?.matched_runs))
@@ -4775,6 +5045,26 @@ function injectTrackedRequestMetadata(requestBody) {
 
         if (!requestBody.request_chat_name && currentChatIdentity.chatName) {
             requestBody.request_chat_name = currentChatIdentity.chatName;
+            changed = true;
+        }
+
+        // 楼层 0 是合法值，这里只能判断字段是否缺失，不能用真值判断。
+        if (requestBody.request_floor == null) {
+            const currentFloor = readCurrentGenerationFloor();
+            if (currentFloor != null) {
+                requestBody.request_floor = currentFloor;
+                changed = true;
+            }
+        }
+
+        // 这个函数会被 CHAT_COMPLETION_SETTINGS_READY 和 fetch 补丁各调一次。
+        // 只在字段缺失时才生成，保证 state 里记的 id 和真正发出去的请求体一致。
+        if (requestBody.request_client_generation_id) {
+            state.currentGenerationClientId = requestBody.request_client_generation_id;
+        } else {
+            const generationClientId = createClientGenerationId();
+            requestBody.request_client_generation_id = generationClientId;
+            state.currentGenerationClientId = generationClientId;
             changed = true;
         }
     }
@@ -4997,16 +5287,32 @@ async function refreshBackendData({ silent = false } = {}) {
         state.pluginRulesError = "";
         syncWaitingQueueExpandedState();
         syncPluginRuleExpandedState();
-        if (state.uiSettings.abnormalOnly) {
-            const { runs: abnormalRuns, total: abnormalTotal } = await fetchAbnormalStoredRuns();
-            state.recentAbnormalRuns = sortRunsByStartedAtDesc(abnormalRuns);
-            state.historyTotal = Math.max(state.historyTotal, abnormalTotal);
+        const activeFilters = getActiveRunFilters();
+        if (!hasActiveRunFilters(activeFilters)) {
+            clearFilteredRuns();
+        } else {
+            const filterKey = buildRunFilterKey(activeFilters);
+            const hasFilteredSnapshot = state.filteredRunsKey === filterKey;
+            if (silent && hasFilteredSnapshot) {
+                mergeIntoFilteredRuns(applyRunFilters(state.runs, activeFilters));
+            } else {
+                const { runs: filteredRuns, total: filteredTotal } = await fetchFilteredStoredRuns(activeFilters);
+                if (buildRunFilterKey() === filterKey) {
+                    state.filteredRuns = sortRunsByStartedAtDesc(filteredRuns);
+                    state.filteredRunsKey = filterKey;
+                    state.historyTotal = Math.max(state.historyTotal, filteredTotal);
+                }
+            }
         }
+        const isRunStillLoaded = (runId) => (
+            state.runs.some((run) => run?.id === runId)
+            || state.filteredRuns.some((run) => run?.id === runId)
+        );
         state.expandedRunIds = new Set(
-            Array.from(state.expandedRunIds).filter((runId) => state.runs.some((run) => run?.id === runId)),
+            Array.from(state.expandedRunIds).filter(isRunStillLoaded),
         );
         state.expandedSuggestionRunIds = new Set(
-            Array.from(state.expandedSuggestionRunIds).filter((runId) => state.runs.some((run) => run?.id === runId)),
+            Array.from(state.expandedSuggestionRunIds).filter(isRunStillLoaded),
         );
         state.backendReady = true;
         state.apiError = "";
@@ -5040,7 +5346,8 @@ async function loadHistoryPage(page) {
 
     try {
         const offset = (nextPage - 1) * HISTORY_PAGE_SIZE;
-        const result = await fetchJson(`/runs?limit=${HISTORY_PAGE_SIZE}&offset=${offset}&${buildRunFilterQuery()}`);
+        const historyFilterQuery = buildRunFilterQuery({ cacheHitOnly: state.uiSettings.cacheHitOnly });
+        const result = await fetchJson(`/runs?limit=${HISTORY_PAGE_SIZE}&offset=${offset}&${historyFilterQuery}`);
         state.historyPage = nextPage;
         state.historyRuns = filterRunsByRequestPurpose(result?.runs);
         state.historyTotal = Math.max(Number(result?.total) || 0, state.historyRuns.length);
@@ -5074,13 +5381,11 @@ async function loadAllHistoryRuns() {
     safeRenderPage();
 
     try {
-        const fetchLimit = Math.max(
-            Number(state.historyTotal) || 0,
-            Number(state.status?.stored_runs) || 0,
-            state.historyRuns.length,
-            HISTORY_PAGE_SIZE,
-        );
-        const result = await fetchJson(`/runs?limit=${fetchLimit}&offset=0&${buildRunFilterQuery()}`);
+        const historyFilterQuery = buildRunFilterQuery({
+            abnormalOnly: state.historyAbnormalOnly,
+            cacheHitOnly: state.uiSettings.cacheHitOnly,
+        });
+        const result = await fetchJson(`/runs?limit=${getStoredRunsFetchLimit()}&offset=0&${historyFilterQuery}`);
         state.historyAllRuns = filterRunsByRequestPurpose(result?.runs);
         state.historyTotal = Math.max(Number(result?.total) || 0, state.historyAllRuns.length, state.historyTotal);
         syncHistorySelectionToLoadedRuns();
@@ -5107,48 +5412,104 @@ async function loadAllHistoryRuns() {
     }
 }
 
-async function fetchAllStoredRuns() {
-    const fetchLimit = Math.max(
+function getStoredRunsFetchLimit() {
+    return Math.max(
         Number(state.historyTotal) || 0,
         Number(state.status?.stored_runs) || 0,
-        state.historyRuns.length,
         HISTORY_PAGE_SIZE,
     );
-    const result = await fetchJson(`/runs?limit=${fetchLimit}&offset=0&${buildRunFilterQuery()}`);
-    const runs = filterRunsByRequestPurpose(result?.runs);
+}
+
+// 服务端已经按筛选条件过滤过，这里再过一遍只是防御：
+// 万一后端是旧版本、不认识某个筛选参数，前端仍然不会把不该显示的记录放出来。
+async function fetchFilteredStoredRuns(filters = getActiveRunFilters()) {
+    const result = await fetchJson(
+        `/runs?limit=${getStoredRunsFetchLimit()}&offset=0&${buildRunFilterQuery(filters)}`,
+    );
+    const runs = applyRunFilters(result?.runs, filters);
     const total = Math.max(Number(result?.total) || 0, runs.length);
     return { runs, total };
 }
 
-async function fetchAbnormalStoredRuns() {
-    const fetchLimit = Math.max(
-        Number(state.historyTotal) || 0,
-        Number(state.status?.stored_runs) || 0,
-        state.recentAbnormalRuns.length,
-        HISTORY_PAGE_SIZE,
-    );
-    const result = await fetchJson(`/runs?limit=${fetchLimit}&offset=0&${buildRunFilterQuery({ abnormalOnly: true })}`);
-    const runs = filterRunsByAbnormal(filterRunsByRequestPurpose(result?.runs), true);
-    const total = Math.max(Number(result?.total) || 0, runs.length);
-    return { runs, total };
+function clearFilteredRuns() {
+    state.filteredRuns = [];
+    state.filteredRunsKey = "";
+    state.filteredRunsPendingKey = "";
 }
 
-async function loadRecentAbnormalRuns() {
-    if (state.recentAbnormalLoading) {
+// 全量筛选结果可能有几 MB，不能每次自动刷新都整包重拉。
+// 已经拿到全量结果之后，后续自动刷新只把最近 N 条里新出现的命中记录并进来。
+function mergeIntoFilteredRuns(runs) {
+    if (!runs.length) {
         return;
     }
 
-    state.recentAbnormalLoading = true;
+    const runsById = new Map();
+    for (const run of state.filteredRuns) {
+        if (run?.id) {
+            runsById.set(run.id, run);
+        }
+    }
+    for (const run of runs) {
+        if (run?.id) {
+            runsById.set(run.id, run);
+        }
+    }
+    state.filteredRuns = sortRunsByStartedAtDesc(Array.from(runsById.values()));
+}
+
+async function loadRunPromptBreakdown(runId) {
+    if (!runId || hasLoadedPromptBreakdown(runId) || isPromptBreakdownLoading(runId)) {
+        return;
+    }
+
+    state.promptBreakdownLoadingRunIds.add(runId);
     safeRenderPage();
 
     try {
-        const { runs, total } = await fetchAbnormalStoredRuns();
-        state.recentAbnormalRuns = sortRunsByStartedAtDesc(runs);
+        const result = await fetchJson(`/runs/${encodeURIComponent(runId)}`);
+        cachePromptBreakdown(runId, result?.run?.prompt_breakdown ?? null);
+    } catch {
+        // 取不到明细不影响其它信息，标记成"已取过但没有"，避免展开一次就重试一次。
+        cachePromptBreakdown(runId, null);
+    } finally {
+        state.promptBreakdownLoadingRunIds.delete(runId);
+        safeRenderPage();
+    }
+}
+
+async function loadFilteredRuns() {
+    const filters = getActiveRunFilters();
+    if (!hasActiveRunFilters(filters)) {
+        clearFilteredRuns();
+        safeRenderPage();
+        return;
+    }
+
+    const filterKey = buildRunFilterKey(filters);
+    if (state.filteredRunsLoading && state.filteredRunsPendingKey === filterKey) {
+        return;
+    }
+
+    state.filteredRunsLoading = true;
+    state.filteredRunsPendingKey = filterKey;
+    safeRenderPage();
+
+    try {
+        const { runs, total } = await fetchFilteredStoredRuns(filters);
+        // 请求期间用户可能又改了筛选，过期结果直接丢弃。
+        if (buildRunFilterKey() !== filterKey) {
+            return;
+        }
+        state.filteredRuns = sortRunsByStartedAtDesc(runs);
+        state.filteredRunsKey = filterKey;
         state.historyTotal = Math.max(state.historyTotal, total);
     } catch (error) {
         state.apiError = error instanceof Error ? error.message : String(error);
     } finally {
-        state.recentAbnormalLoading = false;
+        if (state.filteredRunsPendingKey === filterKey) {
+            state.filteredRunsLoading = false;
+        }
         safeRenderPage();
     }
 }
@@ -5712,6 +6073,10 @@ function buildSettingsContentHtml() {
                     <span>显示上下文体量（消息数 / 字符数）</span>
                 </label>
                 <label class="checkbox_label stlp-settings-toggle">
+                    <input id="stlp_output_card_show_prompt_volume" type="checkbox" ${outputCardFields.showPromptVolume ? "checked" : ""} />
+                    <span>显示提示词体积结论（谁占了大头 / 最大单条）</span>
+                </label>
+                <label class="checkbox_label stlp-settings-toggle">
                     <input id="stlp_output_card_show_extension_details" type="checkbox" ${outputCardFields.showExtensionDetails ? "checked" : ""} />
                     <span>显示扩展识别细节（标识 / 方式 / 分数）</span>
                 </label>
@@ -5964,6 +6329,24 @@ function buildDailyAbnormalListText(items) {
         .join(" / ");
 }
 
+// 后端给的是"当前口径下最早有数据的那一天"，换算成从那天到今天跨了几个自然日。
+// 口径与后端的天数窗口一致：N 天窗口覆盖 今天-(N-1) 到今天，共 N 个自然日。
+function getDailySummaryScopeSpanDays(earliestDateKey) {
+    if (typeof earliestDateKey !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(earliestDateKey)) {
+        return 0;
+    }
+
+    const earliest = new Date(`${earliestDateKey}T00:00:00`);
+    if (Number.isNaN(earliest.getTime())) {
+        return 0;
+    }
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const diffDays = Math.round((today.getTime() - earliest.getTime()) / 86400000);
+    return diffDays >= 0 ? diffDays + 1 : 0;
+}
+
 function isDailySummaryRowExpanded(dateKey) {
     return typeof dateKey === "string" && dateKey
         ? state.expandedDailySummaryDateKeys.has(dateKey)
@@ -5984,6 +6367,16 @@ function buildDailySummaryViewHtml() {
     const aggregateAbnormalRuns = rows.reduce((total, row) => total + (Number(row?.abnormal_runs) || 0), 0);
     const aggregateTotalRuns = rows.reduce((total, row) => total + (Number(row?.total_runs) || 0), 0);
     const aggregateAbnormalRate = aggregateTotalRuns ? (aggregateAbnormalRuns / aggregateTotalRuns) * 100 : 0;
+    const scopeEarliestDateKey = normalizeSummaryText(dailySummary?.scope_earliest_date_key) || "";
+    const scopeTotalDays = Math.max(0, Number(dailySummary?.scope_total_days) || 0);
+    const scopeSpanDays = getDailySummaryScopeSpanDays(scopeEarliestDateKey);
+    // 聊天口径下 request_chat_key 是后加的字段，老记录没有，所以经常出现"选再多天也捞不到更多数据"。
+    // 这不是坏了，但必须说出来，否则看起来就是点了没反应。
+    const hasBeyondRangeOption = scopeSpanDays > 0
+        && DAILY_SUMMARY_DAY_OPTIONS.some((days) => days > scopeSpanDays);
+    const scopeRangeNote = hasBeyondRangeOption
+        ? `该${scopeLabel}最早的记录是 ${formatDateKeyLabel(scopeEarliestDateKey)}，共 ${formatCount(scopeTotalDays)} 天有数据。超过 ${formatCount(scopeSpanDays)} 天的窗口已经覆盖全部记录，再往前放大不会有变化。`
+        : "";
 
     return `
         <section class="stlp-section is-open stlp-daily-summary-view">
@@ -5995,10 +6388,17 @@ function buildDailySummaryViewHtml() {
                 </div>
                 <div class="stlp-note">这里只看最近 ${escapeHtml(activeDays)} 天的${escapeHtml(scopeLabel)} Tokens、异常率和耗时走势，不做金额汇总。若某些流式记录 Usage 曾经落成 0，历史统计可能偏低。</div>
                 <div class="stlp-daily-summary-filters">
-                    ${DAILY_SUMMARY_DAY_OPTIONS.map((days) => `
-                        <button class="menu_button stlp-daily-summary-filter ${days === activeDays ? "is-active" : ""}" type="button" data-action="set-daily-summary-days" data-days="${days}" aria-pressed="${days === activeDays ? "true" : "false"}">${days} 天</button>
-                    `).join("")}
+                    ${DAILY_SUMMARY_DAY_OPTIONS.map((days) => {
+                        const beyondRange = scopeSpanDays > 0 && days > scopeSpanDays;
+                        const buttonTitle = beyondRange
+                            ? `当前口径只有 ${formatCount(scopeSpanDays)} 天的记录，${days} 天与之结果相同`
+                            : `按最近 ${days} 天聚合`;
+                        return `
+                        <button class="menu_button stlp-daily-summary-filter ${days === activeDays ? "is-active" : ""} ${beyondRange ? "is-beyond-range" : ""}" type="button" data-action="set-daily-summary-days" data-days="${days}" aria-pressed="${days === activeDays ? "true" : "false"}" title="${escapeHtml(buttonTitle)}">${days} 天</button>
+                    `;
+                    }).join("")}
                 </div>
+                ${scopeRangeNote ? `<div class="stlp-note stlp-daily-summary-range-note">${escapeHtml(scopeRangeNote)}</div>` : ""}
                 ${summary ? `
                     <div class="stlp-grid">
                         <div><strong>总记录数</strong><span>${escapeHtml(formatCount(aggregateTotalRuns))}</span></div>
@@ -6059,7 +6459,8 @@ function buildSummaryHtml() {
     const summaryBody = !state.summary
         ? '<div class="stlp-empty">当前还没有可汇总的后台监控记录。</div>'
         : (() => {
-            const abnormalCount = filterRunsByCacheHit(filterRunsByRequestPurpose(state.runs)).filter(isAbnormalRun).length;
+            // 汇总区固定用全局口径，不跟随上方的筛选勾选，避免统计范围被筛选悄悄改掉。
+            const abnormalCount = filterRunsByRequestPurpose(state.runs).filter(isAbnormalRun).length;
             return `
             <div class="stlp-grid">
                 <div><strong>记录数</strong><span>${escapeHtml(state.summary.total_runs ?? "-")}</span></div>
@@ -6083,8 +6484,27 @@ function buildSummaryHtml() {
     });
 }
 
+// 监控主页所有记录列表的唯一数据入口。
+// 没有筛选时用最近 N 条（state.runs）；一旦有筛选，就改用按筛选组合从全量历史拉回来的结果，
+// 否则筛选只能作用在最近 N 条上，历史里符合条件的记录永远出不来。
+function getMonitorRunsView() {
+    const filters = getActiveRunFilters();
+    const scopedRuns = filterRunsByRequestPurpose(state.runs);
+
+    if (!hasActiveRunFilters(filters)) {
+        return { runs: scopedRuns, filters, filtered: false, ready: true };
+    }
+
+    const ready = Boolean(state.filteredRunsKey) && state.filteredRunsKey === buildRunFilterKey(filters);
+    // 全量结果回来之前，先用最近 N 条里的命中项顶上，保证勾选后立刻有反馈。
+    const runs = ready
+        ? applyRunFilters(state.filteredRuns, filters)
+        : applyRunFilters(state.runs, filters);
+    return { runs, filters, filtered: true, ready };
+}
+
 function getHistoryPreviewRuns() {
-    return sortRunsByStartedAtDesc(filterRunsByCacheHit(filterRunsByRequestPurpose(state.runs))).slice(0, HISTORY_PREVIEW_COUNT);
+    return sortRunsByStartedAtDesc(getMonitorRunsView().runs).slice(0, HISTORY_PREVIEW_COUNT);
 }
 
 function getRunDateKey(run) {
@@ -6121,9 +6541,26 @@ function normalizeSummaryText(value) {
         : "";
 }
 
+function getHistoryDialogSourceRuns() {
+    return filterRunsByRequestPurpose(state.historyAbnormalOnly ? state.historyAllRuns : state.historyRuns);
+}
+
+function getHistoryDialogFilterLabel() {
+    const labels = [];
+    if (state.historyAbnormalOnly) {
+        labels.push("只看异常记录");
+    }
+    if (state.uiSettings.cacheHitOnly) {
+        labels.push("只看缓存命中");
+    }
+    return labels.join(" + ");
+}
+
 function getVisibleHistoryRuns() {
-    const sourceRuns = sortRunsByStartedAtDesc(filterRunsByCacheHit(filterRunsByRequestPurpose(state.historyAbnormalOnly ? state.historyAllRuns : state.historyRuns)));
-    return state.historyAbnormalOnly ? sourceRuns.filter(isAbnormalRun) : sourceRuns;
+    return sortRunsByStartedAtDesc(filterRunsByAbnormal(
+        filterRunsByCacheHit(getHistoryDialogSourceRuns(), state.uiSettings.cacheHitOnly),
+        state.historyAbnormalOnly,
+    ));
 }
 
 function getHistoryTotalPages() {
@@ -6159,6 +6596,9 @@ function buildHistoryPreviewItem(run) {
 function renderHistoryPreview() {
     const previewRuns = getHistoryPreviewRuns();
     if (!previewRuns.length) {
+        if (hasActiveRunFilters()) {
+            return `<div class="stlp-empty">没有符合「${escapeHtml(getRunFilterLabel())}」的历史记录。</div>`;
+        }
         return '<div class="stlp-empty">当前还没有可查看的历史记录。发送几轮消息后，这里会先显示简短版历史。</div>';
     }
 
@@ -6179,9 +6619,10 @@ function buildHistorySectionHtml() {
 }
 
 function renderHistoryDialogRuns() {
+    const sourceRuns = getHistoryDialogSourceRuns();
     const visibleHistoryRuns = getVisibleHistoryRuns();
-    const baseRuns = filterRunsByCacheHit(filterRunsByRequestPurpose(state.historyAbnormalOnly ? state.historyAllRuns : state.historyRuns));
-    if (state.historyLoading && !baseRuns.length) {
+
+    if (state.historyLoading && !sourceRuns.length) {
         return '<div class="stlp-empty">正在加载历史记录...</div>';
     }
 
@@ -6189,12 +6630,12 @@ function renderHistoryDialogRuns() {
         return `<div class="stlp-empty">${escapeHtml(state.historyError)}</div>`;
     }
 
-    if (!baseRuns.length) {
+    if (!sourceRuns.length) {
         return `<div class="stlp-empty">${state.historyAbnormalOnly ? "当前还没有可查看的异常历史记录。" : "当前页没有历史记录。"}</div>`;
     }
 
     if (!visibleHistoryRuns.length) {
-        return `<div class="stlp-empty">${state.uiSettings.cacheHitOnly ? "当前还没有命中的缓存历史记录。" : "当前还没有命中的异常历史记录。"}</div>`;
+        return `<div class="stlp-empty">当前范围内没有符合「${escapeHtml(getHistoryDialogFilterLabel())}」的记录。</div>`;
     }
 
     return `
@@ -6425,6 +6866,7 @@ function buildRunHtml(run, { compactSummary = false, showWaitingQueueAction = tr
                     ${detailSections ? renderHistoryDetailSection("核心信息", detailSections.coreRows) : ""}
                     ${detailSections ? renderHistoryDetailSection("失败证据", detailSections.evidenceRows) : ""}
                     ${detailSections ? renderHistoryDetailSection("诊断与耗时", detailSections.diagnosisRows) : ""}
+                    ${runOpen ? renderPromptVolumeSection(run) : ""}
                     ${detailSections ? renderHistoryDetailSection("注入概况", detailSections.injectionRows) : ""}
                     ${detailSections ? renderHistoryDetailSection("费用细项", detailSections.pricingRows, usageAvailable ? estimatedPriceNote : "") : ""}
                     ${detailSections ? renderHistoryDetailSection("原始识别细节", detailSections.rawRows) : ""}
@@ -6468,35 +6910,34 @@ function buildRunHtml(run, { compactSummary = false, showWaitingQueueAction = tr
 
 function renderRuns() {
     const currentChatName = getTrackedCurrentChatWindowName();
-    const scopedRuns = filterRunsByCacheHit(filterRunsByRequestPurpose(state.runs));
-    const scopedAbnormalRuns = filterRunsByCacheHit(
-        filterRunsByAbnormal(filterRunsByRequestPurpose(state.recentAbnormalRuns), true),
-    );
+    const runsView = getMonitorRunsView();
+    const filterLabel = escapeHtml(getRunFilterLabel(runsView.filters));
 
-    if (!scopedRuns.length && !state.uiSettings.abnormalOnly) {
+    if (!runsView.filtered && !runsView.runs.length) {
         return '<div class="stlp-empty">当前还没有后台监控记录。发送一轮消息后，这里会显示最近 20 条生成详情。</div>';
     }
 
-    let visibleRuns = state.uiSettings.abnormalOnly
-        ? scopedAbnormalRuns
-        : sortRunsByStartedAtDesc(scopedRuns);
+    let matchedRuns = sortRunsByStartedAtDesc(runsView.runs);
+    const chatScoped = Boolean(state.uiSettings.currentChatOnly && currentChatName);
 
-    if (state.uiSettings.currentChatOnly && currentChatName) {
-        visibleRuns = visibleRuns.filter((run) => isRunInTrackedCurrentChat(run));
+    if (chatScoped) {
+        matchedRuns = matchedRuns.filter((run) => isRunInTrackedCurrentChat(run));
     }
 
-    visibleRuns = visibleRuns.slice(0, HISTORY_PREVIEW_COUNT);
+    const matchedCount = matchedRuns.length;
+    const visibleRuns = matchedRuns.slice(0, HISTORY_PREVIEW_COUNT);
 
-    if (state.uiSettings.abnormalOnly && state.recentAbnormalLoading && !scopedAbnormalRuns.length) {
-        return '<div class="stlp-empty">正在加载全部历史里的异常记录...</div>';
+    if (runsView.filtered && !visibleRuns.length && state.filteredRunsLoading) {
+        return `<div class="stlp-empty">正在从全部历史里查找「${filterLabel}」的记录...</div>`;
     }
 
     if (!visibleRuns.length) {
-        if (state.uiSettings.abnormalOnly) {
-            return '<div class="stlp-empty">全部历史里暂时没有可显示的异常记录。</div>';
+        if (runsView.filtered) {
+            const scopeLabel = chatScoped ? "当前聊天的历史记录" : "全部历史记录";
+            return `<div class="stlp-empty">${scopeLabel}里没有符合「${filterLabel}」的记录。取消勾选即可恢复显示全部记录。</div>`;
         }
 
-        const fallbackRuns = getLatestDateRuns(scopedRuns);
+        const fallbackRuns = getLatestDateRuns(filterRunsByRequestPurpose(state.runs));
         return `
             <div class="stlp-note">当前筛选没有命中，已保留最近日期的历史记录。</div>
             ${groupRunsByChatName(fallbackRuns)
@@ -6515,7 +6956,11 @@ function renderRuns() {
         `;
     }
 
-    return groupRunsByChatName(visibleRuns)
+    const filterNote = runsView.filtered
+        ? `<div class="stlp-note">已按「${filterLabel}」从全部历史中筛出 ${escapeHtml(matchedCount)} 条${runsView.ready ? "" : "（仍在同步全部历史）"}，下方最多显示 ${escapeHtml(HISTORY_PREVIEW_COUNT)} 条。上方汇总仍为全局统计。</div>`
+        : "";
+
+    return filterNote + groupRunsByChatName(visibleRuns)
         .map((group) => `
             <section class="stlp-run-group">
                 <div class="stlp-run-group-title">
@@ -6579,6 +7024,7 @@ function buildOutputCardDialogHtml({ withinHistory = false } = {}) {
                     ${renderOutputCardSection("核心信息", sections.coreRows, "", "stlp-output-card-rows-two-column")}
                     ${renderOutputCardSection("失败证据", sections.evidenceRows, "", "stlp-output-card-rows-two-column")}
                     ${renderOutputCardSection("诊断与耗时", sections.diagnosisRows, "", "stlp-output-card-rows-two-column")}
+                    ${renderOutputCardSection("提示词体积", sections.promptVolumeRows, fields.showPromptVolume && snapshot.promptVolume ? snapshot.promptVolumeConclusionText : "", "stlp-output-card-rows-two-column")}
                     ${renderOutputCardSection("注入概况", sections.injectionRows, "", "stlp-output-card-rows-two-column")}
                     ${renderOutputCardSection("注入细项", sections.injectionDetailRows, "", "stlp-output-card-rows-two-column")}
                     ${renderOutputCardSection("扩展识别", sections.extensionRows, "", "stlp-output-card-rows-two-column")}
@@ -7154,30 +7600,20 @@ function handlePanelChangeTarget(target) {
         return true;
     }
 
-    if (target.id === "stlp_abnormal_only") {
-        state.uiSettings.abnormalOnly = Boolean(target.checked);
-        saveUiSettings();
-        if (state.uiSettings.abnormalOnly) {
-            const localAbnormalRuns = filterRunsByAbnormal(state.runs, true);
-            if (localAbnormalRuns.length && !state.recentAbnormalRuns.length) {
-                state.recentAbnormalRuns = sortRunsByStartedAtDesc(localAbnormalRuns);
-            }
-            void loadRecentAbnormalRuns();
+    if (target.id === "stlp_abnormal_only" || target.id === "stlp_cache_hit_only") {
+        if (target.id === "stlp_abnormal_only") {
+            state.uiSettings.abnormalOnly = Boolean(target.checked);
         } else {
-            safeRenderPage();
+            state.uiSettings.cacheHitOnly = Boolean(target.checked);
         }
-        return true;
-    }
-
-    if (target.id === "stlp_cache_hit_only") {
-        state.uiSettings.cacheHitOnly = Boolean(target.checked);
         saveUiSettings();
+        // 先用手上已有的数据立刻重绘，再去后台补全量结果，避免勾选后界面先卡住一拍。
+        safeRenderPage();
         void (async () => {
+            await loadFilteredRuns();
             if (state.historyDialogOpen) {
                 await refreshHistoryDialogData();
-                return;
             }
-            await refreshBackendData({ silent: true });
         })();
         return true;
     }
@@ -7194,6 +7630,7 @@ function handlePanelChangeTarget(target) {
         target.id === "stlp_output_card_show_injection_details"
         || target.id === "stlp_output_card_show_pricing_details"
         || target.id === "stlp_output_card_show_context_volume"
+        || target.id === "stlp_output_card_show_prompt_volume"
         || target.id === "stlp_output_card_show_extension_details"
         || target.id === "stlp_output_card_mask_chat_title"
     ) {
@@ -7203,10 +7640,14 @@ function handlePanelChangeTarget(target) {
             showInjectionDetails: target.id === "stlp_output_card_show_injection_details" ? Boolean(target.checked) : currentFields.showInjectionDetails,
             showPricingDetails: target.id === "stlp_output_card_show_pricing_details" ? Boolean(target.checked) : currentFields.showPricingDetails,
             showContextVolume: target.id === "stlp_output_card_show_context_volume" ? Boolean(target.checked) : currentFields.showContextVolume,
+            showPromptVolume: target.id === "stlp_output_card_show_prompt_volume" ? Boolean(target.checked) : currentFields.showPromptVolume,
             showExtensionDetails: target.id === "stlp_output_card_show_extension_details" ? Boolean(target.checked) : currentFields.showExtensionDetails,
             maskChatTitle: target.id === "stlp_output_card_mask_chat_title" ? Boolean(target.checked) : currentFields.maskChatTitle,
         };
         saveUiSettings();
+        if (state.uiSettings.outputCardFields.showPromptVolume && state.confirmDialog?.runId) {
+            void loadRunPromptBreakdown(state.confirmDialog.runId);
+        }
         safeRenderPage();
         return true;
     }
@@ -7388,6 +7829,9 @@ function handlePanelAction(actionTarget, event) {
 
     if (action === "open-output-card" && runId) {
         openOutputCardDialog(runId, insideHistoryDialog ? "history" : "page");
+        if (getOutputCardFields().showPromptVolume) {
+            void loadRunPromptBreakdown(runId);
+        }
         return true;
     }
 
@@ -7424,6 +7868,9 @@ function handlePanelAction(actionTarget, event) {
         }
         state.uiSettings.dailySummaryDays = nextDays;
         saveUiSettings();
+        // 先渲染再拉数据：refreshBackendData 撞上进行中的刷新会直接早退，
+        // 不先渲染的话按钮高亮要等到下一个自动刷新周期才挪，看起来像点击没生效。
+        safeRenderPage();
         void refreshBackendData({ silent: true });
         return true;
     }
@@ -7710,6 +8157,7 @@ function handlePanelAction(actionTarget, event) {
             state.expandedSuggestionRunIds.delete(runId);
         } else {
             state.expandedRunIds.add(runId);
+            void loadRunPromptBreakdown(runId);
         }
         safeRenderPage();
         return true;
@@ -7766,12 +8214,7 @@ function handlePanelClickTarget(target, event) {
     }
 
     if (target.id === "stlp_refresh_runs") {
-        void (async () => {
-            await refreshBackendData();
-            if (state.uiSettings.abnormalOnly) {
-                await loadRecentAbnormalRuns();
-            }
-        })();
+        void refreshBackendData();
         return true;
     }
 

@@ -140,6 +140,22 @@ function normalizeRequestChatName(value) {
     return normalizeOptionalText(value, 200);
 }
 
+// 前端为每次生成生成的唯一标识。因为 run 只在请求结束后才落盘，
+// 前端无法从列表里认出"正在跑"的那次，只能靠这个 id 把异常记录和当前生成对上。
+function normalizeRequestClientGenerationId(value) {
+    return normalizeOptionalText(value, 100);
+}
+
+// 楼层由前端在发起生成时随请求体带上来，代理侧自己推不出来。0 是合法楼层，负数和非整数一律丢弃。
+function normalizeRequestFloor(value) {
+    const parsed = Number(value);
+    if (!Number.isInteger(parsed) || parsed < 0 || parsed > 1000000) {
+        return null;
+    }
+
+    return parsed;
+}
+
 function resolveExplicitInjectionSource(requestBody) {
     const sourceId = normalizeRequestInjectionSource(
         requestBody?.request_injection_source
@@ -377,19 +393,14 @@ function summarizeMessages(messages) {
         };
     });
 
-    const topMessages = [...messageSizes]
-        .sort((a, b) => b.chars - a.chars)
-        .slice(0, 5);
-
-    const recentMessages = messageSizes.slice(-6);
-
+    // 这里刻意不再落盘 top_messages / recent_messages。
+    // 它们只是 message_sizes 的排序切片，重复存储会让每条记录多出约 1.7KB，
+    // 而消费方从 message_sizes 现算即可，信息没有任何损失。
     return {
         mode: 'messages',
         total_messages: messages.length,
         total_chars: messageSizes.reduce((sum, item) => sum + item.chars, 0),
         role_totals: roleTotals,
-        top_messages: topMessages,
-        recent_messages: recentMessages,
         message_sizes: messageSizes,
     };
 }
@@ -1093,30 +1104,8 @@ function processSseUsageEvent(run, eventBlock) {
 
     try {
         const payload = JSON.parse(payloadText);
-        // #region debug-point A:stream-usage-payload
-        if (payload?.usage || payload?.usageMetadata || payload?.usage_metadata) {
-            console.info('[DEBUG] stream-usage-zero payload', JSON.stringify({
-                runId: run.id,
-                model: run.model,
-                source: run.source,
-                usage: payload.usage ?? null,
-                usageMetadata: payload.usageMetadata ?? payload.usage_metadata ?? null,
-                choicesLength: Array.isArray(payload.choices) ? payload.choices.length : null,
-            }));
-        }
-        // #endregion
         const usage = buildResponseUsageFromPayload(payload);
         const completionReason = buildResponseCompletionReasonFromPayload(payload);
-        // #region debug-point B:stream-usage-normalized
-        if (usage) {
-            console.info('[DEBUG] stream-usage-zero normalized', JSON.stringify({
-                runId: run.id,
-                model: run.model,
-                source: run.source,
-                usage,
-            }));
-        }
-        // #endregion
         if (shouldReplaceCapturedUsage(run.response_usage, usage)) {
             run.response_usage = usage;
         }
@@ -1188,6 +1177,8 @@ export function createGenerationMonitor(request) {
         request_chat_id: normalizeRequestChatId(request.body?.request_chat_id),
         request_chat_id_hash: normalizeRequestChatIdHash(request.body?.request_chat_id_hash),
         request_chat_name: normalizeRequestChatName(request.body?.request_chat_name),
+        request_floor: normalizeRequestFloor(request.body?.request_floor),
+        request_client_generation_id: normalizeRequestClientGenerationId(request.body?.request_client_generation_id),
         permission_level: inferPermissionLevelFromHost(requestHost, 'cloud_full'),
         stream: Boolean(request.body?.stream),
         source: request.body?.chat_completion_source ?? null,
