@@ -105,6 +105,22 @@
 远端 `<SSH_USER>@<SSH_HOST>`，**SSH 端口 <SSH_PORT>**（`scp` 用 `-P <SSH_PORT>`）。
 22 端口会 `Connection reset`。
 
+**必须显式指定密钥**：`~/.ssh/config` 里只给 `github.com` 配了 `sillytavern-server`，
+连服务器时不带 `-i ~/.ssh/sillytavern-server` 会直接 `Permission denied (publickey,password)`。
+
+```
+ssh -p <SSH_PORT> -i ~/.ssh/sillytavern-server <SSH_USER>@<SSH_HOST>
+scp -P <SSH_PORT> -i ~/.ssh/sillytavern-server <local> <SSH_USER>@<SSH_HOST>:/tmp/
+```
+
+`backend-monitor-minimal/` 下那些 `*-remote.mjs` 里写的是 `root@…:22` 加密码，
+**这条路已经不通了**，别再照抄。它们只作为历史留存，已被 `.gitignore` 排除。
+
+`admin` 不能直接写 `/root`，流程是 `scp` 到 `/tmp` 再 `sudo cp` 就位，
+之后用 `chown --reference` / `chmod --reference` 从备份文件抄回属主和权限。
+`node` 不在 `sudo` 的 PATH 里，要跑 `node --check` 得先
+`sudo bash -lc "command -v node"` 取到绝对路径。
+
 | 本地文件 | 远端路径 |
 | --- | --- |
 | `index.js` | `/root/SillyTavern/public/scripts/extensions/third-party/st-latency-profiler/index.js` |
