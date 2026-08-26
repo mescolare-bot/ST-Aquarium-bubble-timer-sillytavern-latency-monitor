@@ -16,6 +16,7 @@
 - `source`
 - `model`
 - `stream`
+- `request_purpose`
 - `message_count`
 - `prompt_chars`
 - `prompt_breakdown`
@@ -58,6 +59,35 @@
 
 先把最核心的每轮生成耗时落盘，再逐步扩展。
 
+## 峰谷计费状态
+
+峰谷计费这轮本地开发已经先收口，当前状态、已完成项和待部署验证项见：
+
+- [`peak-valley-billing-status.md`](./peak-valley-billing-status.md)
+
+## 待部署实测清单
+
+这一轮本地已完成、但还没做真实部署实测的功能，统一整理在：
+
+- [`pending-live-verification-batch.md`](./pending-live-verification-batch.md)
+
+## request_purpose 预留位
+
+这是给后续“正文请求 / 非正文请求”区分预留的字段。
+
+当前默认会写入：
+
+- `chat_main_reply`
+
+后续如果需要区分非正文功能请求，可以继续扩展为例如：
+
+- `non_chat_generation`
+- `plugin_internal_request`
+
+更完整的后续准备说明见：
+
+- [`request-purpose-followup.md`](./request-purpose-followup.md)
+
 ## prompt_breakdown 现在会拆什么
 
 - 每个 `role` 的消息条数和字符数
@@ -98,3 +128,46 @@
 - `prompt_bias` -> `提示词偏置`
 - `before_scenario_anchor` -> `场景前锚点`
 - `after_scenario_anchor` -> `场景后锚点`
+
+## 正文注入来源字段
+
+如果某个脚本是“先把内容注入正文，再跟正文一起发给模型”，不要复用 `request_plugin`。
+
+原因是：
+
+- `request_plugin` 会参与“正文回复 / 拓展调用”分桶
+- 这类脚本本质上还是正文请求，只是带了额外注入来源
+
+这类脚本应显式上报下面这组字段：
+
+- `request_injection_source`
+- `request_injection_source_label`
+
+推荐示例：
+
+```json
+{
+  "request_injection_source": "abstract-external-phone",
+  "request_injection_source_label": "Abstract外置手机"
+}
+```
+
+如果脚本运行在前端页面里，也可以直接调用监控面板暴露的 helper，把来源标记到“下一次正文生成请求”：
+
+```js
+window.STLatencyMonitorInjectionSource?.reportInjectionSource({
+  source: "abstract-external-phone",
+  label: "Abstract外置手机",
+});
+```
+
+为了兼容不同脚本的已有写法，后端同时接受这些别名：
+
+- `injection_source`
+- `injection_source_label`
+- `extension_prompt_source`
+- `extension_prompt_source_label`
+- `prompt_injection_source`
+- `prompt_injection_source_label`
+
+这组字段只用于记录“正文注入来源”，不会把请求改判成拓展调用。

@@ -138,7 +138,6 @@ export const abnormalOptimizationFailedGenerationTypes = [
     'failed_without_output',
     'failed_after_partial_output',
     'failed_generation',
-    'request_timeout',
     'stream_interrupted',
     'suspected_incomplete_generation',
 ];

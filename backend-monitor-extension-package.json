@@ -1,0 +1,149 @@
+{
+  "project": {
+    "display_name": "鱼缸后端监控",
+    "name": "st-latency-profiler",
+    "author": "OpenAI",
+    "description": "SillyTavern 对话链路后台监控面板，展示当前楼层生成耗时、异常阶段与优化建议。",
+    "version": "0.1.31",
+    "minimum_client_version": "1.12.6",
+    "loading_order": 999,
+    "auto_update": false
+  },
+  "repository": {
+    "url": "https://github.com/mescolare-bot/ST-Aquarium-bubble-timer-sillytavern-latency-monitor",
+    "git_remote": "git@github.com:mescolare-bot/ST-Aquarium-bubble-timer-sillytavern-latency-monitor.git",
+    "branch": "main",
+    "local_head": "6a82ea2148e8a3b7bf9c215704c60ed0e2d62695"
+  },
+  "entrypoints": {
+    "frontend_main": "index.js",
+    "frontend_runtime_js": "index.20260825.0305.js",
+    "frontend_style_source": "style.css",
+    "frontend_runtime_css": "style.20260825.0305.css",
+    "manifest": "manifest.json",
+    "backend_runtime": "backend-monitor-minimal/latency-monitor.js",
+    "backend_server_plugin": "backend-monitor-minimal/server-plugin/index.js"
+  },
+  "deployment": {
+    "online_base_url": "http://<SSH_HOST>:8000/",
+    "ssh_host": "<SSH_HOST>",
+    "ssh_port": <SSH_PORT>,
+    "service": "sillytavern.service",
+    "status": "deployed"
+  },
+  "product_scope": {
+    "type": "SillyTavern third-party extension",
+    "goal": "监控聊天生成链路、展示历史记录、异常诊断、等待队列、日聚合和当前聊天相关统计",
+    "mode": "前端扩展 + 后端监控插件 + server-plugin 数据查询接口"
+  },
+  "major_features": [
+    "监控状态页：展示最近生成记录、耗时、异常和诊断信息",
+    "历史记录页：按用途筛选、按聊天归组、支持异常与命中查看",
+    "日聚合页：支持 7/14/30 天切换，并显示总聚合或聊天聚合",
+    "等待队列页：查看和管理等待中的请求标签",
+    "顶部工具区与设置区：包含导出、清理、显示字段、外观等控制项",
+    "当前聊天识别：前端跟踪当前聊天窗口上下文",
+    "精确聊天聚合：按 request_chat_key 对新生成聊天记录做精确归属"
+  ],
+  "architecture": {
+    "frontend": {
+      "files": [
+        "index.js",
+        "index.20260825.0305.js",
+        "style.css",
+        "style.20260825.0305.css",
+        "manifest.json"
+      ],
+      "responsibilities": [
+        "渲染监控面板与各视图",
+        "识别当前聊天窗口和聊天标题",
+        "在请求发送前补充 request_chat_key 等聊天元数据",
+        "调用后端接口并渲染 runs、summary、daily_summary"
+      ]
+    },
+    "backend": {
+      "files": [
+        "backend-monitor-minimal/latency-monitor.js",
+        "backend-monitor-minimal/server-plugin/index.js"
+      ],
+      "responsibilities": [
+        "记录每次生成请求的监控 run",
+        "保存 request_purpose、request_chat_key、request_chat_name 等字段",
+        "提供 /runs、/summary、/status、/settings、/waiting-queue、/plugin-rules 接口",
+        "支持按 request_purpose 和 request_chat_key 查询"
+      ]
+    }
+  },
+  "api_surface": {
+    "base": "/api/plugins/st-latency-monitor",
+    "endpoints": [
+      "/status",
+      "/settings",
+      "/runs",
+      "/summary",
+      "/waiting-queue",
+      "/plugin-rules"
+    ],
+    "key_query_params": [
+      "request_purpose",
+      "request_chat_key",
+      "group_by",
+      "days",
+      "limit",
+      "offset"
+    ]
+  },
+  "request_purpose_modes": [
+    {
+      "key": "chat_main_reply",
+      "label": "正文回复"
+    },
+    {
+      "key": "non_chat_generation",
+      "label": "拓展调用"
+    },
+    {
+      "key": "plugin_internal_request",
+      "label": "插件内部请求"
+    }
+  ],
+  "current_precise_route": {
+    "name": "精确聊天聚合",
+    "status": "enabled",
+    "principle": "请求发出前注入 request_chat_key，请求落库后按 request_chat_key 精确筛选当前聊天",
+    "frontend_injection_points": [
+      "CHAT_COMPLETION_SETTINGS_READY 事件注入",
+      "window.fetch patched fallback"
+    ],
+    "backend_storage_fields": [
+      "request_chat_key",
+      "request_chat_id",
+      "request_chat_id_hash",
+      "request_chat_name"
+    ],
+    "daily_summary_behavior": {
+      "in_chat_window": "聊天聚合",
+      "outside_chat_window": "总聚合"
+    }
+  },
+  "known_limits": [
+    "旧历史记录没有 request_chat_key，无法被精确归并到聊天聚合",
+    "因此聊天聚合从新生成且带聊天键的记录开始累计",
+    "旧历史仍可在普通历史视图中查看，但不应混入精确聊天聚合统计"
+  ],
+  "review_status": {
+    "sealed_for_test": true,
+    "code_review_status": "passed",
+    "blocking_issues_found": 0,
+    "syntax_check_passed": true,
+    "frontend_runtime_entry_synced": true
+  },
+  "test_recommendations": [
+    "在欢迎页确认日聚合显示总聚合/全部用途",
+    "进入真实聊天窗口后确认日聚合切换为聊天聚合",
+    "在当前聊天中新生成一条回复后确认聊天聚合开始出现数据",
+    "切换到其他聊天窗口后确认数据不串组",
+    "返回首页后确认日聚合回到总聚合"
+  ],
+  "handoff_note": "这份扩展当前建议按“精确聊天聚合”路线测试与验收：新数据精确命中，旧历史不承诺自动补齐进聊天聚合。"
+}
