@@ -17,9 +17,9 @@
   },
   "entrypoints": {
     "frontend_main": "index.js",
-    "frontend_runtime_js": "index.20260825.0305.js",
+    "frontend_runtime_js": "index.js",
     "frontend_style_source": "style.css",
-    "frontend_runtime_css": "style.20260825.0305.css",
+    "frontend_runtime_css": "style.css",
     "manifest": "manifest.json",
     "backend_runtime": "backend-monitor-minimal/latency-monitor.js",
     "backend_server_plugin": "backend-monitor-minimal/server-plugin/index.js"
@@ -49,9 +49,7 @@
     "frontend": {
       "files": [
         "index.js",
-        "index.20260825.0305.js",
         "style.css",
-        "style.20260825.0305.css",
         "manifest.json"
       ],
       "responsibilities": [
