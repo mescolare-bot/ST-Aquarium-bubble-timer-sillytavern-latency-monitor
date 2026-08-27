@@ -6058,7 +6058,7 @@ function buildSettingsContentHtml() {
 
     const outputCardContent = `
             <div class="stlp-settings-subtitle">排障卡</div>
-            <div class="stlp-note">默认排障卡只保留核心排障信息和注入概况，目标是尽量缩短卡片长度、让手机端更容易一屏看完。下面这些开关控制是否把次要信息一起塞进去。</div>
+            <div class="stlp-note">排障卡默认只显示核心排障信息和注入概况，卡片较短，手机上通常一屏就能看完。需要更详细的内容时，用下面的开关按需添加。</div>
             <div class="stlp-controls">
                 <label class="checkbox_label stlp-settings-toggle">
                     <input id="stlp_output_card_show_injection_details" type="checkbox" ${outputCardFields.showInjectionDetails ? "checked" : ""} />
@@ -6271,11 +6271,11 @@ function buildSettingsContentHtml() {
                     <span class="stlp-color-wheel-value">${escapeHtml(minimizedButtonStrokeColor.toUpperCase())}</span>
                 </div>
             </label>
-            <div class="stlp-note">当前最小化图标颜色：${escapeHtml(isMinimizedButtonFollowingTheme ? "主色跟随酒馆主题配色" : minimizedButtonCustomColor.toUpperCase())}；描边 ${escapeHtml(minimizedButtonStrokeColor.toUpperCase())}。按钮背景固定透明，常态不再额外带绿色外发光。</div>
+            <div class="stlp-note">当前最小化图标颜色：${escapeHtml(isMinimizedButtonFollowingTheme ? "主色跟随酒馆主题配色" : minimizedButtonCustomColor.toUpperCase())}；描边 ${escapeHtml(minimizedButtonStrokeColor.toUpperCase())}。按钮背景是透明的，只有描边和图标本身会显示颜色。</div>
     `;
     const appearanceContent = `
             <div class="stlp-settings-subtitle">外观与主题</div>
-            <div class="stlp-note">这里收口主题和最小化悬浮图标的显示风格。最小化图标在后台正常时使用下面配置的颜色，后台未连接时固定显示红色；闪烁提醒继续走纯 CSS 动画，不额外增加后台请求。</div>
+            <div class="stlp-note">调整面板主题和最小化悬浮图标的外观。悬浮图标平时显示你选的颜色，后台连不上时会自动变红，方便一眼看出监控是不是还在正常工作。</div>
             ${buildSettingsSubsectionHtml("appearance_theme", "面板主题", themeSummary, themeSubsectionBody)}
             ${buildSettingsSubsectionHtml("appearance_minimized_color", "最小图标选色", minimizedIconSummary, minimizedIconSubsectionBody)}
     `;
