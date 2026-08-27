@@ -1,0 +1,16 @@
+# This project is deployed onto a Linux SillyTavern install, so everything here
+# must stay LF in the working tree as well as in the repo. Without this, Windows
+# clients with core.autocrlf=true check files out as CRLF, which makes every
+# deployed file differ from its local copy by every single line.
+
+* text=auto eol=lf
+
+# Binary / already-compressed formats: never touch these.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.woff binary
+*.woff2 binary
