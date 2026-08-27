@@ -13,6 +13,15 @@ Thumbs.db
 .env
 .env.*
 
+# Private deployment info: real host / port / account / key paths.
+# The tracked docs use placeholders; the real values live here and must never be committed.
+DEPLOY.local.md
+*.local.md
+
+# Personal handoff notes about the maintainer's own server migration.
+# Kept locally; the durable engineering conclusions live in docs/engineering-notes.md.
+task-handoff/
+
 # Remote patch / probe scripts with embedded credentials
 backend-monitor-minimal/install-remote.mjs
 backend-monitor-minimal/inspect-remote-menu.mjs
