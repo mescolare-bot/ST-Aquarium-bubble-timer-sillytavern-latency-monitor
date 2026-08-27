@@ -6914,7 +6914,7 @@ function renderRuns() {
     const filterLabel = escapeHtml(getRunFilterLabel(runsView.filters));
 
     if (!runsView.filtered && !runsView.runs.length) {
-        return '<div class="stlp-empty">当前还没有后台监控记录。发送一轮消息后，这里会显示最近 20 条生成详情。</div>';
+        return `<div class="stlp-empty">当前还没有后台监控记录。发送一轮消息后，这里会显示最近 ${HISTORY_PREVIEW_COUNT} 条生成详情。</div>`;
     }
 
     let matchedRuns = sortRunsByStartedAtDesc(runsView.runs);
