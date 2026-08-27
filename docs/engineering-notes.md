@@ -100,34 +100,36 @@
 
 ---
 
-## 五、部署
+## 五、远程部署时踩过的坑
 
-远端 `<SSH_USER>@<SSH_HOST>`，**SSH 端口 <SSH_PORT>**（`scp` 用 `-P <SSH_PORT>`）。
-22 端口会 `Connection reset`。
+首次安装看 [`installation.md`](installation.md)。这一节只记录**更新已装好的实例**时反复踩到的问题。
+下面的 `<SSH_USER>` / `<SSH_HOST>` / `<SSH_PORT>` / `<SSH_KEY>` / `<ST_ROOT>` 请替换成你自己的值。
 
-**必须显式指定密钥**：`~/.ssh/config` 里只给 `github.com` 配了 `sillytavern-server`，
-连服务器时不带 `-i ~/.ssh/sillytavern-server` 会直接 `Permission denied (publickey,password)`。
+**SSH 密钥要显式指定。** 如果 `~/.ssh/config` 里没有为目标主机配 `IdentityFile`
+（比如只给 `github.com` 配了），不带 `-i` 会直接 `Permission denied (publickey,password)`，
+而报错本身不会告诉你缺的是密钥。
 
 ```
-ssh -p <SSH_PORT> -i ~/.ssh/sillytavern-server <SSH_USER>@<SSH_HOST>
-scp -P <SSH_PORT> -i ~/.ssh/sillytavern-server <local> <SSH_USER>@<SSH_HOST>:/tmp/
+ssh -p <SSH_PORT> -i <SSH_KEY> <SSH_USER>@<SSH_HOST>
+scp -P <SSH_PORT> -i <SSH_KEY> <local> <SSH_USER>@<SSH_HOST>:/tmp/
 ```
 
-`backend-monitor-minimal/` 下那些 `*-remote.mjs` 里写的是 `root@…:22` 加密码，
-**这条路已经不通了**，别再照抄。它们只作为历史留存，已被 `.gitignore` 排除。
+注意 `ssh` 用小写 `-p`、`scp` 用大写 `-P`。
 
-`admin` 不能直接写 `/root`，流程是 `scp` 到 `/tmp` 再 `sudo cp` 就位，
-之后用 `chown --reference` / `chmod --reference` 从备份文件抄回属主和权限。
-`node` 不在 `sudo` 的 PATH 里，要跑 `node --check` 得先
-`sudo bash -lc "command -v node"` 取到绝对路径。
+**非 root 账号不能直接写 `<ST_ROOT>`。** 流程是 `scp` 到 `/tmp` 再 `sudo cp` 就位，
+之后用 `chown --reference` / `chmod --reference` 从备份文件抄回属主和权限，
+否则新文件的属主会变成上传者，服务重启后可能读不到。
+
+**`node` 不在 `sudo` 的 PATH 里**（用 fnm / nvm 之类的版本管理器时尤其如此）。
+要跑 `sudo node --check` 得先 `sudo bash -lc "command -v node"` 取绝对路径。
 
 | 本地文件 | 远端路径 |
 | --- | --- |
-| `index.js` | `/root/SillyTavern/public/scripts/extensions/third-party/st-latency-profiler/index.js` |
+| `index.js` | `<ST_ROOT>/public/scripts/extensions/third-party/st-latency-profiler/index.js` |
 | `style.css` | 同上目录 `/style.css` |
 | `manifest.json` | 同上目录 `/manifest.json` |
-| `backend-monitor-minimal/latency-monitor.js` | `/root/SillyTavern/src/latency-monitor.js` |
-| `backend-monitor-minimal/server-plugin/index.js` | `/root/SillyTavern/plugins/st-latency-monitor/index.js` |
+| `backend-monitor-minimal/latency-monitor.js` | `<ST_ROOT>/src/latency-monitor.js` |
+| `backend-monitor-minimal/server-plugin/index.js` | `<ST_ROOT>/plugins/st-latency-monitor/index.js` |
 
 覆盖前先备份（惯例后缀 `.bak-YYYYMMDD-HHMMSS`），之后
 `sudo systemctl restart sillytavern`。

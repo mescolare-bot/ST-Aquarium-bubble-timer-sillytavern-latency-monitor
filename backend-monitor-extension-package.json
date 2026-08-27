@@ -2,7 +2,7 @@
   "project": {
     "display_name": "鱼缸后端监控",
     "name": "st-latency-profiler",
-    "author": "OpenAI",
+    "author": "mescolare-bot",
     "description": "SillyTavern 对话链路后台监控面板，展示当前楼层生成耗时、异常阶段与优化建议。",
     "version": "0.1.31",
     "minimum_client_version": "1.12.6",
@@ -12,8 +12,7 @@
   "repository": {
     "url": "https://github.com/mescolare-bot/ST-Aquarium-bubble-timer-sillytavern-latency-monitor",
     "git_remote": "git@github.com:mescolare-bot/ST-Aquarium-bubble-timer-sillytavern-latency-monitor.git",
-    "branch": "main",
-    "local_head": "6a82ea2148e8a3b7bf9c215704c60ed0e2d62695"
+    "branch": "main"
   },
   "entrypoints": {
     "frontend_main": "index.js",
@@ -24,12 +23,18 @@
     "backend_runtime": "backend-monitor-minimal/latency-monitor.js",
     "backend_server_plugin": "backend-monitor-minimal/server-plugin/index.js"
   },
-  "deployment": {
-    "online_base_url": "http://<SSH_HOST>:8000/",
-    "ssh_host": "<SSH_HOST>",
-    "ssh_port": <SSH_PORT>,
-    "service": "sillytavern.service",
-    "status": "deployed"
+  "install_targets": {
+    "note": "Paths are relative to the SillyTavern root. See docs/installation.md for the full procedure.",
+    "extension_dir": "public/scripts/extensions/third-party/st-latency-profiler/",
+    "backend_runtime": "src/latency-monitor.js",
+    "server_plugin": "plugins/st-latency-monitor/index.js",
+    "shared_modules": [
+      "src/settings-ui/",
+      "src/shared/",
+      "plugins/settings-ui/",
+      "plugins/shared/"
+    ],
+    "core_patch_required": "src/endpoints/backends/chat-completions.js"
   },
   "product_scope": {
     "type": "SillyTavern third-party extension",

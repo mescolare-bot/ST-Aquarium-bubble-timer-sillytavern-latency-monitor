@@ -41,6 +41,12 @@
   - 放到 SillyTavern 的 `plugins/st-latency-monitor/index.js`
   - 提供查看接口
 
+- `settings-ui/`、`shared/`
+  - 被上面两个文件用相对路径引入，**同一份内容要放到 `src/` 和 `plugins/` 两个位置**
+
+> 只放这几个文件还不够，还必须给酒馆本体的 `chat-completions.js` 打补丁，
+> 否则不会产生任何记录。完整步骤见 [`../docs/installation.md`](../docs/installation.md)。
+
 ## 查看接口
 
 - `/api/plugins/st-latency-monitor/status`
@@ -59,18 +65,6 @@
 
 先把最核心的每轮生成耗时落盘，再逐步扩展。
 
-## 峰谷计费状态
-
-峰谷计费这轮本地开发已经先收口，当前状态、已完成项和待部署验证项见：
-
-- [`peak-valley-billing-status.md`](./peak-valley-billing-status.md)
-
-## 待部署实测清单
-
-这一轮本地已完成、但还没做真实部署实测的功能，统一整理在：
-
-- [`pending-live-verification-batch.md`](./pending-live-verification-batch.md)
-
 ## request_purpose 预留位
 
 这是给后续“正文请求 / 非正文请求”区分预留的字段。
@@ -84,18 +78,15 @@
 - `non_chat_generation`
 - `plugin_internal_request`
 
-更完整的后续准备说明见：
-
-- [`request-purpose-followup.md`](./request-purpose-followup.md)
-
 ## prompt_breakdown 现在会拆什么
 
 - 每个 `role` 的消息条数和字符数
 - 每条 message 的字符数
 - 每条 message 的文本分片数
 - 每条 message 的图片/音频/工具分片数
-- 最大的 5 条 message
-- 最近的 6 条 message
+
+"最大的 N 条"和"最近的 N 条"**不再落盘**——它们只是 `message_sizes` 的排序切片，
+消费方现算即可，重复存储每条记录白白多出约 1.7 KB。
 
 这样可以直接看出：
 
