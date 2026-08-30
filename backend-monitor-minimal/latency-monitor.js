@@ -13,6 +13,9 @@ import {
 
 const LOG_DIR = path.join(process.cwd(), 'data', 'default-user', 'latency-monitor');
 const LOG_FILE = path.join(LOG_DIR, 'runs.jsonl');
+// 服务插件和本文件是两个互不相通的模块实例，只能靠 LOG_DIR 下的文件传话。
+// 这里只读不写，写入与过期清理都由服务插件那侧负责，避免两个写者互相覆盖。
+const CLIENT_STOP_SIGNALS_FILE = path.join(LOG_DIR, 'client-stop-signals.json');
 const REQUEST_PURPOSE_VALUES = new Set(['chat_main_reply', 'non_chat_generation', 'plugin_internal_request']);
 const KNOWN_PLUGIN_LABELS = new Map([
     ['st-baibai-inkwell', '柏宝砚'],
@@ -144,6 +147,15 @@ function normalizeRequestChatName(value) {
 // 前端无法从列表里认出"正在跑"的那次，只能靠这个 id 把异常记录和当前生成对上。
 function normalizeRequestClientGenerationId(value) {
     return normalizeOptionalText(value, 100);
+}
+
+// 生成类型对应酒馆 Generate(type, ...) 的取值，只有前端能从 GENERATION_STARTED 事件拿到。
+// 白名单之外一律丢弃，避免调用方塞进任意字符串。
+const GENERATION_TYPE_VALUES = new Set(['normal', 'regenerate', 'swipe', 'continue', 'impersonate', 'quiet']);
+
+function normalizeRequestGenerationType(value) {
+    const normalized = typeof value === 'string' ? value.trim() : '';
+    return GENERATION_TYPE_VALUES.has(normalized) ? normalized : '';
 }
 
 // 楼层由前端在发起生成时随请求体带上来，代理侧自己推不出来。0 是合法楼层，负数和非整数一律丢弃。
@@ -451,6 +463,14 @@ function detectFailedStage(run) {
     return null;
 }
 
+// 酒馆六处转发函数都是同一套接线（src/endpoints/backends/chat-completions.js:225 起）：
+//   request.socket.on('close', () => controller.abort())
+// 上游请求带着这个 signal 发出，所以 "The operation was aborted." 有且只有一个成因——
+// 浏览器到酒馆的连接断了，酒馆随即掐掉上游请求。跟模型、跟上游接口都没有关系。
+function isClientAbortError(errorText) {
+    return /operation was aborted|aborterror|user aborted a request/.test(errorText);
+}
+
 function detectAbnormalType(run) {
     const phases = run.phases ?? {};
     const errorText = String(run.error ?? '').toLowerCase();
@@ -462,6 +482,12 @@ function detectAbnormalType(run) {
 
     if (!hasError && !isSuspectedIncompleteGeneration && !isStreamInterrupted) {
         return null;
+    }
+
+    // 断连要排在流式中断和"未输出即失败"之前：这两类描述的是现象，而断连是确定的成因，
+    // 归错了会把用户引去换模型、关流式，而真正该看的是自己这一侧的连接。
+    if (isClientAbortError(errorText)) {
+        return run.client_stopped ? 'client_stopped' : 'client_disconnected';
     }
 
     if (isTimeout) {
@@ -777,13 +803,33 @@ function buildAbnormalBillingDetail(run, settings) {
     };
 }
 
+let lastMonitorSettingsErrorMessage = '';
+
+// 设置读不出来时排障建议和计价会静默退回默认值，外部完全看不出来，所以这里必须留声音。
+// 同一个原因只播报一次，恢复正常后重置，避免每条异常记录都刷一行。
+async function readMonitorSettingsWithFallback() {
+    try {
+        const settings = await readMonitorSettings();
+        lastMonitorSettingsErrorMessage = '';
+        return settings;
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (message !== lastMonitorSettingsErrorMessage) {
+            lastMonitorSettingsErrorMessage = message;
+            console.error(`[latency-monitor] 读取监控设置失败，排障建议与计价已退回默认值：${message}`);
+        }
+
+        return null;
+    }
+}
+
 async function buildAbnormalDetail(run) {
     const abnormalType = detectAbnormalType(run);
     if (!abnormalType) {
         return null;
     }
 
-    const settings = await readMonitorSettings().catch(() => null);
+    const settings = await readMonitorSettingsWithFallback();
     const failedStage = detectFailedStage(run);
     const suggestionResult = generateAbnormalOptimizationSuggestions({
         settings: settings ?? undefined,
@@ -810,6 +856,22 @@ async function buildAbnormalDetail(run) {
         permission_level: suggestionResult.permission_level,
         ...billingDetail,
     };
+}
+
+// 只在这次确实是断连、且带着生成 id 时才去读文件，正常生成不会产生额外 I/O。
+// 信号迟到时这次会退化成"意外断连"，宁可多报一次断连，也不要把真故障说成用户主动停止。
+async function hasClientStopSignal(clientGenerationId) {
+    if (typeof clientGenerationId !== 'string' || !clientGenerationId.length) {
+        return false;
+    }
+
+    try {
+        const content = await fs.readFile(CLIENT_STOP_SIGNALS_FILE, 'utf8');
+        const parsed = JSON.parse(content);
+        return Boolean(parsed && typeof parsed === 'object' && parsed[clientGenerationId]);
+    } catch {
+        return false;
+    }
 }
 
 async function appendRun(run) {
@@ -1178,6 +1240,7 @@ export function createGenerationMonitor(request) {
         request_chat_id_hash: normalizeRequestChatIdHash(request.body?.request_chat_id_hash),
         request_chat_name: normalizeRequestChatName(request.body?.request_chat_name),
         request_floor: normalizeRequestFloor(request.body?.request_floor),
+        request_generation_type: normalizeRequestGenerationType(request.body?.request_generation_type),
         request_client_generation_id: normalizeRequestClientGenerationId(request.body?.request_client_generation_id),
         permission_level: inferPermissionLevelFromHost(requestHost, 'cloud_full'),
         stream: Boolean(request.body?.stream),
@@ -1204,6 +1267,7 @@ export function createGenerationMonitor(request) {
         output_bytes: 0,
         output_chars: null,
         error: null,
+        client_stopped: false,
     };
 
     let finalized = false;
@@ -1367,6 +1431,10 @@ export function createGenerationMonitor(request) {
 
         if (!run.stream && phases.upstream_request_started) {
             run.metrics.nonstream_response_ms = finishedAtMs - phases.upstream_request_started;
+        }
+
+        if (isClientAbortError(String(run.error ?? '').toLowerCase())) {
+            run.client_stopped = await hasClientStopSignal(run.request_client_generation_id);
         }
 
         run.abnormal_detail = await buildAbnormalDetail(run);

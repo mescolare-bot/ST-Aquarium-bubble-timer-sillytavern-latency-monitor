@@ -22,6 +22,15 @@ const LOG_DIR = path.join(process.cwd(), 'data', 'default-user', 'latency-monito
 const LOG_FILE = path.join(LOG_DIR, 'runs.jsonl');
 const WAITING_QUEUE_FILE = path.join(LOG_DIR, 'waiting-queue.json');
 const PLUGIN_RULE_CANDIDATES_FILE = path.join(LOG_DIR, 'plugin-rule-candidates.jsonl');
+const FORCE_STOP_DIAGNOSTICS_FILE = path.join(LOG_DIR, 'force-stop-diagnostics.jsonl');
+// 前端在真正中止之前先把生成 id 写进来，latency-monitor 落盘时据此区分
+// "用户自己停的" 和 "连接意外断了"——两者的错误文本完全一样，服务端只能靠这个分辨。
+const CLIENT_STOP_SIGNALS_FILE = path.join(LOG_DIR, 'client-stop-signals.json');
+const CLIENT_STOP_SIGNAL_TTL_MS = 5 * 60 * 1000;
+
+// 诊断记录只在用户手动点"终止生成"时写入，正常一次就几 KB。
+// 上限用来挡住前端意外把大对象塞进来，避免重演 frontend-debug.jsonl 涨到 64MB 的旧事。
+const MAX_FORCE_STOP_DIAGNOSTICS_BYTES = 32 * 1024;
 
 // 剥掉 prompt_breakdown 之后单条 run 约 1.5KB，这里仍然保留上限：
 // 全量 5000+ 条一次返回依然是好几 MB，没有任何视图需要这么多。
@@ -348,6 +357,38 @@ async function removeWaitingQueueEntry(runId) {
 async function appendPluginRuleCandidate(candidate) {
     await fs.mkdir(LOG_DIR, { recursive: true });
     await fs.appendFile(PLUGIN_RULE_CANDIDATES_FILE, `${JSON.stringify(candidate)}\n`, 'utf8');
+}
+
+async function appendForceStopDiagnostics(record) {
+    await fs.mkdir(LOG_DIR, { recursive: true });
+    await fs.appendFile(FORCE_STOP_DIAGNOSTICS_FILE, `${JSON.stringify(record)}\n`, 'utf8');
+}
+
+// 这里是唯一的写者，latency-monitor 那侧只读，所以不需要额外的并发保护。
+// 每次写入顺带丢掉过期项，文件长期只有个位数条目。
+async function recordClientStopSignal(clientGenerationId) {
+    await fs.mkdir(LOG_DIR, { recursive: true });
+
+    let current = {};
+    try {
+        const parsed = JSON.parse(await fs.readFile(CLIENT_STOP_SIGNALS_FILE, 'utf8'));
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            current = parsed;
+        }
+    } catch {
+        // 文件不存在或内容损坏都当作空表重建。
+    }
+
+    const nowMs = Date.now();
+    const next = {};
+    for (const [id, at] of Object.entries(current)) {
+        if (Number.isFinite(at) && nowMs - at < CLIENT_STOP_SIGNAL_TTL_MS) {
+            next[id] = at;
+        }
+    }
+    next[clientGenerationId] = nowMs;
+
+    await fs.writeFile(CLIENT_STOP_SIGNALS_FILE, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
 }
 
 async function readWaitingQueueRuns() {
@@ -1154,6 +1195,50 @@ export async function init(router) {
                 matched_runs: backfillResult.updatedCount,
                 matched_run_ids: backfillResult.updatedRuns.map((run) => run.id),
             });
+        } catch (error) {
+            res.status(400).json({
+                ok: false,
+                error: error instanceof Error ? error.message : String(error),
+            });
+        }
+    });
+
+    router.post('/force-stop-diagnostics', async (req, res) => {
+        try {
+            const payload = req.body;
+            if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+                throw new Error('diagnostics payload must be an object.');
+            }
+
+            const serialized = JSON.stringify(payload);
+            if (Buffer.byteLength(serialized, 'utf8') > MAX_FORCE_STOP_DIAGNOSTICS_BYTES) {
+                throw new Error('diagnostics payload is too large.');
+            }
+
+            // 前端时间可能因为设备时钟漂移不可信，落盘时间以服务端为准。
+            await appendForceStopDiagnostics({
+                ...payload,
+                received_at: new Date().toISOString(),
+            });
+
+            res.json({ ok: true });
+        } catch (error) {
+            res.status(400).json({
+                ok: false,
+                error: error instanceof Error ? error.message : String(error),
+            });
+        }
+    });
+
+    router.post('/client-stop-signal', async (req, res) => {
+        try {
+            const clientGenerationId = normalizeOptionalText(req.body?.client_generation_id);
+            if (!clientGenerationId) {
+                throw new Error('client_generation_id is required.');
+            }
+
+            await recordClientStopSignal(clientGenerationId);
+            res.json({ ok: true });
         } catch (error) {
             res.status(400).json({
                 ok: false,

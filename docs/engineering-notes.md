@@ -167,3 +167,101 @@ scp -P <SSH_PORT> -i <SSH_KEY> <local> <SSH_USER>@<SSH_HOST>:/tmp/
 
 两处修完后归零仍未清零，说明**还有第三个成因没找到**，很可能是上游兼容层本身就只回了占位 usage
 （假设 B「上游返回的数值本身就是 0」当时只是"部分确认"）。下一步应该从上游响应原文取证，而不是继续改解析逻辑。
+
+---
+
+## 七、未收口的问题：一键终止在真卡死时无效
+
+本节结论均来自实读 `<ST_ROOT>/public/script.js`，不是推测。行号取自实测版本，升级酒馆后需重新核对。
+
+### 先决事实：`stopGeneration()` 能掐断什么
+
+```js
+export function stopGeneration() {
+    let stopped = false;
+    if (streamingProcessor) { streamingProcessor.onStopStreaming(); stopped = true; }
+    if (abortController) { abortController.abort('Clicked stop button'); hideStopButton(); stopped = true; }
+    eventSource.emit(event_types.GENERATION_STOPPED);
+    return stopped;
+}
+```
+
+两条必须记住的：
+
+1. **返回值没有信息量。** 模块级 `abortController` 在文件加载时就已 `new`，恒为真值，所以返回值恒为 `true`。
+   只有"调用是否抛异常"能说明问题。
+2. **流式请求用的是 `streamingProcessor.abortController.signal`，不是模块级那个。**
+   而 `streamingProcessor` 在源码里有 6 处会被置 `null`。一旦置空，`stopGeneration()` 就再也掐不断任何东西，
+   只剩下 abort 一个没人监听的 controller，外加 emit 一个事件。
+
+### 三层兜底会在同一场景下同时失效
+
+触发场景：**流已经断了，但酒馆 UI 还锁着。**
+
+| 层 | 机制 | 失效原因 |
+| --- | --- | --- |
+| 1 | `stopGeneration()` | `streamingProcessor` 已置 null，调用变成空转 |
+| 2 | `abortTrackedGenerationRequests()` | 兜底句柄已被提前撤销，见下 |
+| 3 | `forceUnlockSillyTavernSendUi()` | 提前返回并谎报成功，见缺陷二 |
+
+第二层值得单独说明：`monitorGenerationResponseLifecycle()` 克隆响应、把克隆流读完就调 `removeActiveGenerationRequest()`。
+**只要服务端把流关掉了——哪怕内容根本没返回完、酒馆那边还卡着——克隆流就算读完**，句柄随即撤销。
+于是恰恰在最需要它的时候 `abortable` 为 0。
+
+### 缺陷一：`sillyTavernGenerationActive` 永久泄漏（已实锤）
+
+酒馆的生成事件是不对称的：
+
+- `GENERATION_STARTED` 在 `Generate()` 入口**无条件** emit，全文件仅此一处。
+- `GENERATION_ENDED` 全文件**也只有一处** emit——在 `hideStopButton()` 内，且被 NOOP 守卫包着，
+  只有 `#mes_stop` 当前不是 `display:none` 时才发。
+
+而 `showStopButton()` 要到 `finishGenerating()` 里才调用。在那之前的一整排早退路径——
+斜杠命令拦截、kobold 流式不支持、horde 被禁、服务器 ping 失败，以及**所有 dry run**——
+都已经 emit 过 STARTED，却因为停止键从未显示而**永远不会 emit ENDED**。
+
+监控清除该标志的唯一途径就是 ENDED / STOPPED 这两个事件，于是标志永久停在 `true`。
+
+实测证据：一次完全空转的点击（确认无生成在跑）记录显示 `streaming_processor: null`、
+跟踪请求 `0/0`、`is_send_press: false`、`data-generating` 不存在、发送键正常可见，
+而 `generation_active` 仍为 `true`。
+
+后果：`openManualForceStopGenerationDialog()` 靠 `isSillyTavernGenerationLikelyActive()` 选 normal / rescue，
+标志恒真意味着 **rescue 模式实际上永远进不去**。
+
+### 缺陷二：强制解锁提前返回并谎报成功（已实锤）
+
+`forceUnlockSillyTavernSendUi()` 先等 1 秒观察 `isSillyTavernSendUiLocked()`，
+一旦判定"没锁"就直接返回 `selfRecovered: true`，**一个恢复动作都不做**，
+对外文案却是"酒馆已自行解除生成锁，发送按钮可用"。
+
+该判定只看四个标志：`data-generating` / `data-swiping` / `is_send_press` / swipeState。
+只要卡死状态没体现在这四个标志上，它就原样报成功。
+
+顺带纠正一个容易走偏的猜测：**`activateSendButtons()` 是 export 的，而且它自己就设 `is_send_press = false`**，
+所以"扩展无权解锁"不成立，解锁能力是够的，问题出在判定和时机。
+（真正没被 export 的是 `unblockGeneration()`，但它多做的那几件事扩展并不需要。）
+
+### 诊断通道
+
+`POST /force-stop-diagnostics` → `<ST_ROOT>/data/default-user/latency-monitor/force-stop-diagnostics.jsonl`。
+
+只在手动点终止时写，一次点击一条记录，内含四张只读快照：
+`dialog-open` / `before-stop` / `after-stop` / `after-unlock`。
+服务端补 `received_at`（前端时钟不可信），32 KB 上限防止意外灌入大对象。
+
+| 快照字段 | 用来判定 |
+| --- | --- |
+| `streaming_processor` | 第一层：为 null 即 `stopGeneration()` 空转 |
+| `tracked_requests.abortable` | 第二层：为 0 即兜底句柄已被提前撤销 |
+| `send_ui_lock.locked` | 第三层：为 false 即会走谎报成功的分支 |
+| `buttons.*_display` | 状态标志与按钮真实可见性是否脱节 |
+
+采集全部只读，逐项兜错，上报 fire-and-forget 且吞掉所有异常——诊断本身不得影响终止流程。
+
+### 仍未确定的部分
+
+上面两个缺陷**都不足以单独解释"卡死时点了完全没用"**：真卡死时泄漏的标志同样是 `true`，
+`stopGeneration()` 照样会被调用。
+
+**结论需要一条真实卡死的诊断记录。在拿到之前不要凭推测改终止逻辑。**
