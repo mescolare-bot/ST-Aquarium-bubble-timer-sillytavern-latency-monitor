@@ -2,8 +2,10 @@ import {
     abnormalOptimizationContextSuggestionRules,
     abnormalOptimizationFailedGenerationTypes,
     abnormalOptimizationStageSuggestionRules,
+    abnormalOptimizationStreamingRelevantTypes,
     abnormalOptimizationStreamingSuggestionRules,
     abnormalOptimizationSuggestionRules,
+    abnormalOptimizationSuppressedTypes,
 } from '../config/abnormal-optimization-suggestion-rules.js';
 import { cloneMonitorSettingsDefaults } from '../config/monitor-settings-default.js';
 import { resolvePermissionLevel } from './monitor-settings-validator.js';
@@ -35,6 +37,11 @@ function shouldShowSuggestions(settings, abnormalType) {
         return false;
     }
 
+    // 这类不是故障，无论范围设成什么都不给建议。
+    if (abnormalOptimizationSuppressedTypes.includes(abnormalType)) {
+        return false;
+    }
+
     const scope = getSuggestionScope(settings);
     if (scope === 'all_abnormal') {
         return true;
@@ -53,6 +60,44 @@ function uniqueSuggestions(values) {
         }
 
         seen.add(value);
+        output.push(value);
+    }
+
+    return output;
+}
+
+// 同一个意思换个措辞写两遍会白白吃掉本就只有三条的名额，而字面去重抓不到。
+// 这里只收口实际会撞车的几个主题，先出现的留下（证据类排在最前，优先级最高）。
+const SUGGESTION_TOPIC_PATTERNS = [
+    /最大输出长度|长度上限/,
+    /续写/,
+    /流式输出/,
+    /聊天历史/,
+    /代理和网络|代理节点/,
+];
+
+// 一条建议可能同时压中多个主题（"调大上限，或者直接续写"就同时占了上限和续写），
+// 所以要把命中的主题全部登记，否则后面单说"续写"的那条还是会漏进来。
+function dedupeSuggestionsByTopic(values) {
+    const seenTopics = new Set();
+    const output = [];
+
+    for (const value of uniqueSuggestions(values)) {
+        const topicIndexes = [];
+        SUGGESTION_TOPIC_PATTERNS.forEach((pattern, index) => {
+            if (pattern.test(value)) {
+                topicIndexes.push(index);
+            }
+        });
+
+        if (topicIndexes.some((index) => seenTopics.has(index))) {
+            continue;
+        }
+
+        for (const index of topicIndexes) {
+            seenTopics.add(index);
+        }
+
         output.push(value);
     }
 
@@ -84,7 +129,7 @@ function buildEvidenceSuggestions({ httpStatus = null, errorText = '', completio
         /authentication failed/,
     ]);
     if (hasInvalidApiKeyEvidence) {
-        suggestions.push('建议先检查 API Key 是否填错、过期，或前后多了空格/前缀');
+        suggestions.push('API Key 可能填错、过期，或者前后多了空格，先核对一遍');
     }
 
     const hasInsufficientQuotaEvidence = matchesAnyKeyword(normalizedErrorText, [
@@ -95,7 +140,7 @@ function buildEvidenceSuggestions({ httpStatus = null, errorText = '', completio
         /credit balance is too low/,
     ]);
     if (hasInsufficientQuotaEvidence) {
-        suggestions.push('建议先检查账号余额、套餐额度或计费状态，这更像额度耗尽');
+        suggestions.push('账号余额或套餐额度大概率用完了，去服务方后台看一眼');
     }
 
     const hasRateLimitExceededEvidence = matchesAnyKeyword(normalizedErrorText, [
@@ -106,7 +151,7 @@ function buildEvidenceSuggestions({ httpStatus = null, errorText = '', completio
         /tokens per min/,
     ]);
     if (hasRateLimitExceededEvidence) {
-        suggestions.push('建议先降低并发或稍后重试，这更像瞬时限流，不一定是余额问题');
+        suggestions.push('这是瞬时限流，不是余额问题，等一两分钟再发或降低并发');
     }
 
     const hasDeploymentNotFoundEvidence = matchesAnyKeyword(normalizedErrorText, [
@@ -115,7 +160,7 @@ function buildEvidenceSuggestions({ httpStatus = null, errorText = '', completio
         /unknown deployment/,
     ]);
     if (hasDeploymentNotFoundEvidence) {
-        suggestions.push('建议先检查部署名称是否填写正确，这更像部署名而不是模型名有误');
+        suggestions.push('部署名称填错了，注意这一栏要填部署名，不是模型名');
     }
 
     const hasModelNotFoundEvidence = matchesAnyKeyword(normalizedErrorText, [
@@ -125,7 +170,7 @@ function buildEvidenceSuggestions({ httpStatus = null, errorText = '', completio
         /no such model/,
     ]);
     if (hasModelNotFoundEvidence) {
-        suggestions.push('建议先检查模型 ID 是否正确，或当前渠道是否支持这个模型');
+        suggestions.push('模型 ID 填错了，或者当前渠道不支持这个模型');
     }
 
     const hasContextLengthEvidence = matchesAnyKeyword(normalizedErrorText, [
@@ -136,7 +181,7 @@ function buildEvidenceSuggestions({ httpStatus = null, errorText = '', completio
         /max context length/,
     ]);
     if (hasContextLengthEvidence) {
-        suggestions.push('建议先减聊天历史、世界书、记忆和检索内容，这更像上下文超限');
+        suggestions.push('上下文超出了模型上限，先砍掉一部分聊天历史、世界书和记忆');
     }
 
     const hasContentFilterEvidence = matchesAnyKeyword(normalizedErrorText, [
@@ -153,7 +198,7 @@ function buildEvidenceSuggestions({ httpStatus = null, errorText = '', completio
         /blocklist/,
     ]);
     if (hasContentFilterEvidence) {
-        suggestions.push('建议先检查输出内容是否触发安全或内容拦截，这类问题重试通常没用');
+        suggestions.push('内容触发了安全拦截，重试没用，改写这一楼的内容再发');
     }
 
     const hasOutputLimitEvidence = matchesAnyKeyword(normalizedErrorText, [
@@ -166,7 +211,7 @@ function buildEvidenceSuggestions({ httpStatus = null, errorText = '', completio
         /max_tokens/,
     ]);
     if (hasOutputLimitEvidence) {
-        suggestions.push('建议先检查最大输出长度或直接续写，这更像输出被上限截断');
+        suggestions.push('输出被长度上限截断了，调大最大输出长度，或者直接让它续写');
     }
 
     const hasConnectionRefusedEvidence = matchesAnyKeyword(normalizedErrorText, [
@@ -174,7 +219,7 @@ function buildEvidenceSuggestions({ httpStatus = null, errorText = '', completio
         /connection refused/,
     ]);
     if (hasConnectionRefusedEvidence) {
-        suggestions.push('建议先检查目标接口地址和端口是否真的可达，这更像对端没有正常接入');
+        suggestions.push('接口地址或端口连不上，先确认那边的服务是不是真的在跑');
     }
 
     const hasDnsFailureEvidence = matchesAnyKeyword(normalizedErrorText, [
@@ -184,7 +229,7 @@ function buildEvidenceSuggestions({ httpStatus = null, errorText = '', completio
         /name resolution/,
     ]);
     if (hasDnsFailureEvidence) {
-        suggestions.push('建议先检查域名、代理 DNS 和解析链路，这更像域名解析失败');
+        suggestions.push('域名解析失败，检查地址有没有写错，以及代理的 DNS 设置');
     }
 
     const hasConnectionResetEvidence = matchesAnyKeyword(normalizedErrorText, [
@@ -194,7 +239,7 @@ function buildEvidenceSuggestions({ httpStatus = null, errorText = '', completio
         /unexpected eof/,
     ]);
     if (hasConnectionResetEvidence) {
-        suggestions.push('建议先检查代理或网关稳定性，这更像中途断链或上游主动断开');
+        suggestions.push('连接中途被断开了，检查代理或网关是否稳定');
     }
 
     const hasAuthEvidence = !hasInvalidApiKeyEvidence && (httpStatus === 401
@@ -208,7 +253,7 @@ function buildEvidenceSuggestions({ httpStatus = null, errorText = '', completio
             /access denied/,
         ]));
     if (hasAuthEvidence) {
-        suggestions.push('建议检查 API 密钥、权限和账号配置是否正确');
+        suggestions.push('密钥或账号权限有问题，先核对 API 密钥和账号配置');
     }
 
     const hasModelConfigEvidence = !hasDeploymentNotFoundEvidence
@@ -219,7 +264,7 @@ function buildEvidenceSuggestions({ httpStatus = null, errorText = '', completio
                 /endpoint.+not found/,
             ]));
     if (hasModelConfigEvidence) {
-        suggestions.push('建议检查模型名称、接口地址或部署名称是否填写正确');
+        suggestions.push('模型名称、接口地址、部署名称这三个里有一个填错了');
     }
 
     const hasRequestConfigEvidence = !hasContextLengthEvidence
@@ -234,7 +279,7 @@ function buildEvidenceSuggestions({ httpStatus = null, errorText = '', completio
                 /invalid_request_error/,
             ]));
     if (hasRequestConfigEvidence) {
-        suggestions.push('建议检查请求参数、上下文体量和接口格式是否符合当前模型要求');
+        suggestions.push('当前模型不接受这次的请求参数，先检查接口格式和上下文大小');
     }
 
     const hasRateLimitEvidence = !hasInsufficientQuotaEvidence
@@ -245,7 +290,7 @@ function buildEvidenceSuggestions({ httpStatus = null, errorText = '', completio
                 /too many requests/,
             ]));
     if (hasRateLimitEvidence) {
-        suggestions.push('建议检查额度、限流和账号余额，必要时稍后重试');
+        suggestions.push('额度或限流拦住了这次请求，先看余额，再考虑等会儿重试');
     }
 
     const hasConnectivityEvidence = !hasConnectionRefusedEvidence
@@ -262,7 +307,7 @@ function buildEvidenceSuggestions({ httpStatus = null, errorText = '', completio
             /ssl/,
         ]);
     if (hasConnectivityEvidence) {
-        suggestions.push('建议检查代理、网关和上游接口地址的连通性');
+        suggestions.push('连不上上游接口，检查代理、网关和接口地址');
     }
 
     const hasTimeoutEvidence = httpStatus === 408
@@ -274,7 +319,7 @@ function buildEvidenceSuggestions({ httpStatus = null, errorText = '', completio
             /etimedout/,
         ]);
     if (hasTimeoutEvidence) {
-        suggestions.push('建议检查超时设置、代理链路和上游响应稳定性');
+        suggestions.push('这次请求超时了，调大超时时间，或者换一个响应更快的模型');
     }
 
     const hasUpstreamInstabilityEvidence = (typeof httpStatus === 'number' && httpStatus >= 500)
@@ -289,7 +334,7 @@ function buildEvidenceSuggestions({ httpStatus = null, errorText = '', completio
             /temporarily unavailable/,
         ]);
     if (hasUpstreamInstabilityEvidence) {
-        suggestions.push('建议优先判断上游服务是否波动，稍后重试或切换模型');
+        suggestions.push('上游服务在波动，等几分钟再试，或者换一个模型');
     }
 
     return uniqueSuggestions(suggestions).slice(0, 2);
@@ -324,7 +369,9 @@ export function generateAbnormalOptimizationSuggestions({
         ? abnormalRule[resolvedPermissionLevel]
         : [];
     const stageSuggestions = abnormalOptimizationStageSuggestionRules[failedStage] ?? [];
-    const streamingSuggestions = isStreaming ? abnormalOptimizationStreamingSuggestionRules.streaming : [];
+    const streamingSuggestions = isStreaming && abnormalOptimizationStreamingRelevantTypes.includes(abnormalType)
+        ? abnormalOptimizationStreamingSuggestionRules.streaming
+        : [];
     const contextSuggestions = suspectedContextOverweight ? abnormalOptimizationContextSuggestionRules : [];
     const evidenceSuggestions = buildEvidenceSuggestions({ httpStatus, errorText, completionReason });
 
@@ -341,7 +388,7 @@ export function generateAbnormalOptimizationSuggestions({
     suggestions.push(...baseSuggestions.slice(1));
 
     const limit = getSuggestionLimit(settings);
-    const finalSuggestions = uniqueSuggestions(suggestions).slice(0, limit);
+    const finalSuggestions = dedupeSuggestionsByTopic(suggestions).slice(0, limit);
 
     if (!finalSuggestions.length) {
         return {

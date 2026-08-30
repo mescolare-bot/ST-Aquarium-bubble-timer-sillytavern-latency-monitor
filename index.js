@@ -16,6 +16,9 @@ const MINIMIZED_BUTTON_DRAG_THRESHOLD = 4;
 const MOBILE_OPEN_GUARD_MS = 360;
 const WAITING_QUEUE_EDIT_LOCK_MS = 1500;
 const PENDING_INJECTION_SOURCE_TTL_MS = 10000;
+// 生成类型来自 GENERATION_STARTED 事件，而拓展自己发的生成请求不走酒馆的 Generate()，
+// 拿不到这个事件。用消费一次 + TTL 双重兜底，避免上一次正文生成的类型串到拓展调用头上。
+const PENDING_GENERATION_TYPE_TTL_MS = 10000;
 const SYNTHETIC_ESCAPE_IGNORE_WINDOW_MS = 800;
 const SEND_UI_UNLOCK_POLL_INTERVAL_MS = 50;
 const SEND_UI_UNLOCK_SELF_RECOVERY_MS = 1000;
@@ -26,7 +29,9 @@ const DEFAULT_SWIPE_STATE_NONE = "none";
 const DAILY_SUMMARY_DAY_OPTIONS = [7, 14, 30];
 let stRequestHeadersFactoryPromise = null;
 const THEME_MODE_SEQUENCE = ["dawn", "rose", "night", "follow_tavern"];
+// client_stopped 刻意不在这里：那是用户自己按的停止，再弹"这次生成大概率不会正常返回"很荒唐。
 const ACTIONABLE_ABNORMAL_TYPES = new Set([
+    "client_disconnected",
     "failed_without_output",
     "failed_after_partial_output",
     "failed_generation",
@@ -138,6 +143,16 @@ const REQUEST_PURPOSE_LABELS = {
     plugin_internal_request: "插件内部请求",
 };
 
+// 对应酒馆 Generate(type, ...) 的六种取值，由 GENERATION_STARTED 事件的第一个参数下发。
+const GENERATION_TYPE_LABELS = {
+    normal: "正常发送",
+    regenerate: "重新生成",
+    swipe: "滑动",
+    continue: "续写",
+    impersonate: "替我说",
+    quiet: "后台静默",
+};
+
 const REQUEST_PLUGIN_MATCH_MODE_LABELS = {
     explicit: "调用方显式上报",
     explicit_label_only: "仅显式上报名称",
@@ -180,6 +195,8 @@ const TRACE_SOURCE_LABELS = {
 };
 
 const ABNORMAL_TYPE_LABELS = {
+    client_stopped: "你主动停止",
+    client_disconnected: "连接中断",
     failed_without_output: "未输出即失败",
     failed_after_partial_output: "部分输出后失败",
     failed_generation: "完整生成失败",
@@ -331,8 +348,12 @@ const state = {
     // 随请求体一起发给后端的本次生成标识。后端只在请求结束后才落盘 run，
     // 列表里永远看不到"正在跑"的那次，只能靠这个 id 判断一条异常记录是不是当前这次生成。
     currentGenerationClientId: "",
+    // 一次手动终止过程中攒下的只读快照，动作走完后合成一条上报，随后清空。
+    forceStopDiagnosticsSnapshots: [],
     sillyTavernSwipeConstants: undefined,
     pendingInjectionSource: null,
+    // { type, reportedAt }：等待随下一个生成请求带下去的生成类型。
+    pendingGenerationType: null,
     chatWindowContext: {
         chatKey: "",
         chatName: "",
@@ -1223,6 +1244,108 @@ function buildGenerationStopStatusText(stopResult, unlockResult, rescueMode) {
     return parts.join("；");
 }
 
+function readDiagnosticValue(reader) {
+    try {
+        const value = reader();
+        return value === undefined ? null : value;
+    } catch {
+        return "<unreadable>";
+    }
+}
+
+function readDiagnosticElementDisplay(selector) {
+    const element = document.querySelector(selector);
+    if (!(element instanceof HTMLElement)) {
+        return "<missing>";
+    }
+
+    return window.getComputedStyle(element).display;
+}
+
+/**
+ * 纯只读采集，不触碰任何终止/解锁状态。每一项单独兜错，读不到就记 "<unreadable>"，
+ * 保证诊断本身永远不会把终止流程带崩。
+ */
+function captureForceStopDiagnosticsSnapshot(phase) {
+    try {
+        return {
+            phase,
+            at: new Date().toISOString(),
+            // 只有 streamingProcessor 还活着，stopGeneration() 才能真正掐断流式请求；
+            // 它一旦被置 null，那次调用就只剩下 abort 一个没人监听的模块级 controller。
+            streaming_processor: readDiagnosticValue(() => {
+                const processor = sillyTavernScript?.streamingProcessor;
+                if (!processor) {
+                    return null;
+                }
+
+                return {
+                    is_finished: processor.isFinished ?? null,
+                    is_stopped: processor.isStopped ?? null,
+                    abort_signal_aborted: processor.abortController?.signal?.aborted ?? null,
+                };
+            }),
+            // 监控自己的兜底句柄。克隆流一读完就会被撤销，这里看它在关键时刻还在不在。
+            tracked_requests: readDiagnosticValue(() => ({
+                total: state.activeGenerationRequests.size,
+                abortable: getAbortableGenerationRequestCount(),
+            })),
+            // 强制解锁的判定依据：四个标志全为假时会直接判定"已自行恢复"并且不做任何动作。
+            send_ui_lock: readDiagnosticValue(() => ({
+                data_generating: document.body?.dataset?.generating ?? null,
+                data_swiping: document.body?.dataset?.swiping ?? null,
+                is_send_press: sillyTavernScript?.is_send_press ?? null,
+                swipe_state: readSillyTavernSwipeState() || null,
+                locked: isSillyTavernSendUiLocked(),
+            })),
+            // 用来对照上面的标志和按钮真实可见性是否脱节。
+            buttons: readDiagnosticValue(() => ({
+                mes_stop_display: readDiagnosticElementDisplay("#mes_stop"),
+                send_but_display: readDiagnosticElementDisplay("#send_but"),
+                stop_trigger_found: Boolean(findSillyTavernStopGenerationTrigger()),
+            })),
+            monitor_state: readDiagnosticValue(() => ({
+                generation_active: state.sillyTavernGenerationActive,
+                recovery_window_active: hasRecentGenerationRecoveryWindow(),
+                current_generation_client_id: state.currentGenerationClientId || null,
+            })),
+            stop_generation_available: readDiagnosticValue(() => typeof stopGeneration === "function"),
+        };
+    } catch {
+        return { phase, at: new Date().toISOString(), capture_failed: true };
+    }
+}
+
+// 服务端看到的错误文本对"用户主动停止"和"连接意外断开"完全一样（都是 socket 关闭触发的 abort），
+// 只能靠这个信号区分。必须赶在真正中止之前发出去，否则 run 已经落盘，信号就白发了。
+function sendClientStopSignal() {
+    const clientGenerationId = state.currentGenerationClientId;
+    if (!clientGenerationId) {
+        return Promise.resolve();
+    }
+
+    try {
+        return fetchJson("/client-stop-signal", {
+            method: "POST",
+            body: JSON.stringify({ client_generation_id: clientGenerationId }),
+        }).catch(() => {});
+    } catch {
+        return Promise.resolve();
+    }
+}
+
+function sendForceStopDiagnostics(record) {
+    // 旁路上报：诊断写不进去也不能影响终止结果，所以这里把所有失败都吞掉。
+    try {
+        void fetchJson("/force-stop-diagnostics", {
+            method: "POST",
+            body: JSON.stringify(record),
+        }).catch(() => {});
+    } catch {
+        // 序列化失败等同步异常同样忽略。
+    }
+}
+
 function tryStopGenerationWithMonitorFallback(options = {}) {
     const stopMethod = tryStopSillyTavernGeneration(options);
     const abortedRequestCount = abortTrackedGenerationRequests();
@@ -1244,9 +1367,19 @@ async function executeGenerationStopAction() {
         ? state.confirmDialog.mode
         : "";
     const rescueMode = manualForceStopMode === "rescue";
+    const diagnosticsSnapshots = Array.isArray(state.forceStopDiagnosticsSnapshots)
+        ? [...state.forceStopDiagnosticsSnapshots]
+        : [];
+    diagnosticsSnapshots.push(captureForceStopDiagnosticsSnapshot("before-stop"));
+
+    // 这条路径的顺序完全可控，等信号真的发出去再中止，落盘时一定能对上。
+    await sendClientStopSignal();
+
     const stopResult = tryStopGenerationWithMonitorFallback({
         forceProbe: rescueMode,
     });
+    diagnosticsSnapshots.push(captureForceStopDiagnosticsSnapshot("after-stop"));
+
     if (state.pendingGenerationIntervention) {
         clearPendingGenerationIntervention();
     }
@@ -1267,11 +1400,26 @@ async function executeGenerationStopAction() {
         };
     }
 
+    diagnosticsSnapshots.push(captureForceStopDiagnosticsSnapshot("after-unlock"));
+
     state.apiStatus = buildGenerationStopStatusText(stopResult, unlockResult, rescueMode);
     safeRenderPage();
+
+    state.forceStopDiagnosticsSnapshots = [];
+    sendForceStopDiagnostics({
+        kind: "manual_force_stop",
+        client_at: new Date().toISOString(),
+        dialog_mode: manualForceStopMode || null,
+        rescue_mode: rescueMode,
+        stop_result: stopResult,
+        unlock_result: unlockResult,
+        status_text: state.apiStatus,
+        snapshots: diagnosticsSnapshots,
+    });
 }
 
 function openManualForceStopGenerationDialog() {
+    state.forceStopDiagnosticsSnapshots = [captureForceStopDiagnosticsSnapshot("dialog-open")];
     state.confirmDialog = {
         type: "manual-force-stop-generation",
         mode: hasAbortableGenerationRequest() || isSillyTavernGenerationLikelyActive()
@@ -2173,6 +2321,11 @@ function getEntryOriginLabel(value) {
     return ENTRY_ORIGIN_LABELS[value] || "主界面生成记录";
 }
 
+function getRunGenerationTypeLabel(run) {
+    const normalized = normalizeGenerationType(run?.request_generation_type);
+    return normalized ? GENERATION_TYPE_LABELS[normalized] : "";
+}
+
 function getSourceLabel(value) {
     if (typeof value !== "string" || !value.trim()) {
         return "未记录来源";
@@ -2979,6 +3132,15 @@ function getRunFailureEvidenceSummary(run, abnormalType, failedStage, abnormalBi
     const contextHeavy = isRunContextLikelyHeavy(run);
     const completionReasonLabel = getRunCompletionReasonLabel(run);
     const hasCompletionReason = completionReasonLabel !== "-";
+
+    // 这两类的成因在酒馆源码里是确定的（socket 关闭直接触发 abort），不必用"更像"这种推测口吻。
+    if (abnormalType === "client_stopped") {
+        return "你自己中止了这次生成";
+    }
+
+    if (abnormalType === "client_disconnected") {
+        return hasUsageEvidence ? "浏览器和酒馆之间断开了连接，且已发生计费" : "浏览器和酒馆之间断开了连接";
+    }
 
     if (abnormalType === "request_timeout") {
         return contextHeavy ? "更像请求超时，且上下文偏重" : "更像请求超时";
@@ -4986,6 +5148,39 @@ function getActivePendingInjectionSource() {
     return normalized;
 }
 
+function normalizeGenerationType(value) {
+    const normalized = typeof value === "string" ? value.trim() : "";
+    return Object.prototype.hasOwnProperty.call(GENERATION_TYPE_LABELS, normalized) ? normalized : "";
+}
+
+function clearPendingGenerationType() {
+    state.pendingGenerationType = null;
+}
+
+function setPendingGenerationType(value) {
+    const normalized = normalizeGenerationType(value);
+    state.pendingGenerationType = normalized
+        ? { type: normalized, reportedAt: Date.now() }
+        : null;
+}
+
+function getActivePendingGenerationType() {
+    const pending = state.pendingGenerationType;
+    const normalized = normalizeGenerationType(pending?.type);
+    if (!normalized) {
+        clearPendingGenerationType();
+        return "";
+    }
+
+    const reportedAt = Number(pending?.reportedAt);
+    if (!Number.isFinite(reportedAt) || reportedAt <= 0 || Date.now() - reportedAt > PENDING_GENERATION_TYPE_TTL_MS) {
+        clearPendingGenerationType();
+        return "";
+    }
+
+    return normalized;
+}
+
 function isChatGenerationRequestTarget(input) {
     const rawUrl = typeof input === "string"
         ? input
@@ -5053,6 +5248,16 @@ function injectTrackedRequestMetadata(requestBody) {
             const currentFloor = readCurrentGenerationFloor();
             if (currentFloor != null) {
                 requestBody.request_floor = currentFloor;
+                changed = true;
+            }
+        }
+
+        // 同样是"消费一次"：第二次调用时字段已在请求体上，不会被重复取用。
+        if (!requestBody.request_generation_type) {
+            const generationType = getActivePendingGenerationType();
+            if (generationType) {
+                requestBody.request_generation_type = generationType;
+                clearPendingGenerationType();
                 changed = true;
             }
         }
@@ -5190,10 +5395,17 @@ function installGenerationSettingsHook() {
         return;
     }
 
-    eventSource.on(event_types.GENERATION_STARTED, () => {
+    // 事件签名为 (type, options, dryRun)。dry run 不会真正发出请求，
+    // 记下它的类型只会污染下一个真实请求，所以直接跳过。
+    eventSource.on(event_types.GENERATION_STARTED, (generationType, _options, dryRun) => {
+        if (!dryRun) {
+            setPendingGenerationType(generationType);
+        }
         markSillyTavernGenerationStarted();
     });
     eventSource.on(event_types.GENERATION_STOPPED, () => {
+        // markSillyTavernGenerationStopped 会清空生成 id，信号必须赶在它前面发。
+        void sendClientStopSignal();
         markSillyTavernGenerationStopped();
     });
     eventSource.on(event_types.GENERATION_ENDED, () => {
@@ -5202,6 +5414,17 @@ function installGenerationSettingsHook() {
     eventSource.on(event_types.CHAT_COMPLETION_SETTINGS_READY, (generateData) => {
         injectTrackedRequestMetadata(generateData);
     });
+
+    // GENERATION_STOPPED 事件到达时酒馆往往已经断开连接，run 可能抢先落盘。
+    // 捕获阶段能跑在酒馆自己的点击处理之前，是唯一能保证顺序的位置，
+    // 所以这个 DOM 监听和上面的事件监听是互补关系，不是重复。
+    document.addEventListener("click", (event) => {
+        const target = event.target;
+        if (target instanceof Element && target.closest("#mes_stop")) {
+            void sendClientStopSignal();
+        }
+    }, true);
+
     state.generationSettingsHookInstalled = true;
 }
 
@@ -6727,9 +6950,8 @@ function buildRunHtml(run, { compactSummary = false, showWaitingQueueAction = tr
     const suggestions = abnormalDetail?.optimization_suggestions?.suggestions ?? [];
     const summaryLabel = isAbnormalRun(run) ? getAbnormalTypeLabel(abnormalDetail.abnormal_type) : "正常完成";
     const statusBadgeClass = isAbnormalRun(run) ? "stlp-badge stlp-badge-abnormal" : "stlp-badge";
-    const sourceLabel = getRunSourceLabel(run);
     const pluginLabel = getRunPluginLabel(run);
-    const entryOriginLabel = getEntryOriginLabel(run?.entry_origin);
+    const generationTypeLabel = getRunGenerationTypeLabel(run);
     const failedStage = getRunFailedStage(run);
     const failedStageLabel = getFailedStageLabel(failedStage);
     const floorLabel = getRunFloorLabel(run);
@@ -6850,13 +7072,13 @@ function buildRunHtml(run, { compactSummary = false, showWaitingQueueAction = tr
                         <div class="stlp-run-summary-text">${escapeHtml(compactSummaryText)}</div>
                     `
                     : `
-                        <span class="stlp-badge">${escapeHtml(entryOriginLabel)}</span>
+                        ${pluginLabel ? `<span class="stlp-badge stlp-badge-plugin">${escapeHtml(pluginLabel)}</span>` : ""}
+                        ${generationTypeLabel ? `<span class="stlp-badge">${escapeHtml(generationTypeLabel)}</span>` : ""}
                         ${floorLabel ? `<span class="stlp-badge">${escapeHtml(floorLabel)}</span>` : ""}
                         <span class="stlp-badge">${escapeHtml(startedAtCompact)}</span>
                         <span>${escapeHtml(run?.model || "未记录模型")}</span>
                         <span class="${statusBadgeClass}">${escapeHtml(summaryLabel)}</span>
                         ${failedStage ? `<span class="stlp-badge stlp-badge-stage">卡在 ${escapeHtml(failedStageLabel)}</span>` : ""}
-                        <span>来源 ${escapeHtml(sourceLabel)}</span>
                         <span>总耗时 ${escapeHtml(formatSeconds(run?.metrics?.total_ms))}</span>
                     `}
             </div>

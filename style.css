@@ -3092,6 +3092,13 @@ body.stlp-page-host-open {
     font-weight: 700;
 }
 
+.stlp-badge-plugin {
+    background: color-mix(in srgb, var(--stlp-primary) 20%, var(--stlp-surface-1));
+    color: var(--stlp-panel-text);
+    border: 1px solid color-mix(in srgb, var(--stlp-primary) 44%, transparent);
+    font-weight: 700;
+}
+
 .stlp-page-host.stlp-theme-dawn .stlp-badge-abnormal,
 .stlp-page-host.stlp-theme-rose .stlp-badge-abnormal {
     background: var(--stlp-highlight-warn-bg);
@@ -3118,7 +3125,9 @@ body.stlp-page-host-open {
 }
 
 .stlp-page-host.stlp-theme-dawn .stlp-badge-injection,
-.stlp-page-host.stlp-theme-rose .stlp-badge-injection {
+.stlp-page-host.stlp-theme-rose .stlp-badge-injection,
+.stlp-page-host.stlp-theme-dawn .stlp-badge-plugin,
+.stlp-page-host.stlp-theme-rose .stlp-badge-plugin {
     background: color-mix(in srgb, var(--stlp-primary) 18%, var(--stlp-surface-1));
     border-color: color-mix(in srgb, var(--stlp-primary) 34%, transparent);
     color: var(--stlp-panel-text);
