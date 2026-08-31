@@ -2,14 +2,50 @@
 
 > **先读这一段再动手。**
 >
-> 这个扩展**必须修改 SillyTavern 本体的一个源码文件**才能工作。没有自动安装脚本，
-> 补丁要手动打。如果你不接受改动酒馆本体，这个扩展对你没用，可以到此为止。
+> 这个扩展**必须修改 SillyTavern 本体的一个源码文件**才能工作。如果你不接受改动酒馆本体，
+> 这个扩展对你没用，可以到此为止。
 >
-> 只装前端不打补丁的后果很隐蔽：面板能正常打开、插件也会显示加载成功、接口全都返回 200，
-> 但记录永远是空的，而且界面不会给出任何错误提示。**如果你装完发现没有数据，
-> 十有八九是漏了[第 4 步](#4-给酒馆本体打补丁必须)。**
+> **不能只在酒馆界面里贴仓库地址装。** 那样只会装上前端，后端和补丁一样都不会装，
+> 结果是面板打得开、插件显示加载成功、接口全返回 200，但记录永远是空的。
+> 安装必须在**服务器上**执行，因为浏览器写不了 `src/`、`plugins/` 和 `config.yaml`。
 
 下文的 `<ST_ROOT>` 指你的 SillyTavern 根目录（源码安装通常是 `SillyTavern/`）。
+
+## 一键安装（推荐）
+
+在**能访问酒馆文件的机器上**（通常就是跑酒馆的那台服务器）：
+
+```bash
+git clone https://github.com/mescolare-bot/ST-Aquarium-bubble-timer-sillytavern-latency-monitor.git
+cd ST-Aquarium-bubble-timer-sillytavern-latency-monitor
+node install.mjs <ST_ROOT>
+```
+
+脚本会把六处文件放好、给本体打上全部补丁、开启服务端插件开关。之后重启酒馆，
+再在浏览器里按 `Ctrl + Shift + R` 强制刷新就行。
+
+补丁部分是**幂等**的：每一处先按内容特征判断是否已经打过，打过就跳过。所以升级酒馆之后
+直接重跑一次即可，不会重复插入，也不会覆盖你手工改的别的东西。
+
+```bash
+node install.mjs <ST_ROOT> --dry-run     # 只报告会做什么，不写任何文件
+node install.mjs <ST_ROOT> --uninstall   # 还原本体并删掉装进去的文件
+```
+
+第一次打补丁前，脚本会把原始的 `chat-completions.js` 备份成
+`chat-completions.js.st-latency-monitor.bak`（只在这个备份不存在时创建，
+所以它始终是最干净的那一份）。打完补丁会自动跑一次 `node --check`，
+万一失败会立刻从备份还原。
+
+如果脚本报告**找不到锚点代码**，说明你的酒馆版本和补丁不匹配，它会告诉你是哪一处，
+然后原样退出、不改动本体。这种情况按下面的手动步骤自己定位。
+
+装完之后面板会自己检查补丁装全了没有。**少装或漏装时，记录列表上方会直接显示缺了哪几处
+以及各自的后果**，不用再靠翻文档排查。
+
+---
+
+以下是手动安装步骤，只有在脚本跑不通时才需要。
 
 ## 组成部分
 
@@ -109,7 +145,10 @@ import { inferPermissionLevelFromHost } from './settings-ui/service/monitor-sett
 
 **先备份**：`cp chat-completions.js chat-completions.js.bak`
 
-一共 7 处改动。每一处都是"找到锚点，在它前后插入几行"，不要删除任何原有代码。
+一共 9 处插入。每一处都是"找到锚点，在它前后插入几行"，不要删除任何原有代码。
+
+> 这些插入点的权威定义在 [`backend-monitor-minimal/shared/chat-completions-patch.js`](../backend-monitor-minimal/shared/chat-completions-patch.js)
+> ——安装脚本和面板自检都读它。本节内容如果和那个文件对不上，以那个文件为准。
 
 ### 4.1 加 import
 
@@ -179,7 +218,36 @@ router.post('/generate', async function (request, response) {
 这个名单决定了哪些接入源会被监控。你用的源不在里面就不会有记录——需要的话自己加，
 名字以你这版酒馆 `CHAT_COMPLETION_SOURCES` 里实际有的为准（不同版本会增减）。
 
-### 4.4 记录上游请求
+### 4.4 向上游索取流式 usage（漏了会没有 token 数）
+
+找到组装请求体之后、处理 CUSTOM 排除项之前的位置：
+
+```js
+            'n': request.body.n,
+            ...bodyParams,
+        };
+
+        if (request.body.chat_completion_source === CHAT_COMPLETION_SOURCES.CUSTOM) {
+```
+
+在那个 `};` 和 `if` 之间插入：
+
+```js
+        if (request.body.stream && [
+            CHAT_COMPLETION_SOURCES.OPENAI,
+            CHAT_COMPLETION_SOURCES.CUSTOM,
+        ].includes(request.body.chat_completion_source)) {
+            requestBody.stream_options = {
+                ...(requestBody.stream_options ?? {}),
+                include_usage: true,
+            };
+        }
+```
+
+OpenAI 兼容接口在流式模式下默认**不返回** usage，必须显式索取。漏掉这一处的话，
+其它功能都正常，只有流式生成的 token 数和成本估算会一直是空的——又是一个不报错的坑。
+
+### 4.5 记录上游请求
 
 找到：
 
@@ -200,7 +268,7 @@ router.post('/generate', async function (request, response) {
         monitor?.mark('upstream_headers_received');
 ```
 
-### 4.5 流式分支
+### 4.6 流式分支
 
 找到：
 
@@ -223,7 +291,7 @@ router.post('/generate', async function (request, response) {
         }
 ```
 
-### 4.6 非流式分支
+### 4.7 非流式分支
 
 找到：
 
@@ -242,7 +310,7 @@ router.post('/generate', async function (request, response) {
             await monitor?.finalize({ outcome: 'json' });
 ```
 
-### 4.7 错误分支和 catch
+### 4.8 错误分支和 catch
 
 上游返回错误的分支，在 `console.error('Chat completion request error: ', ...)` 后面加：
 
@@ -259,7 +327,7 @@ router.post('/generate', async function (request, response) {
         await monitor?.finalize({ outcome: 'exception' });
 ```
 
-### 4.8 检查语法
+### 4.9 检查语法
 
 ```bash
 node --check <ST_ROOT>/src/endpoints/backends/chat-completions.js
@@ -321,8 +389,12 @@ Initializing plugin from <ST_ROOT>/plugins/st-latency-monitor/index.js
 
 ## 卸载
 
-1. 删掉第 1、2、3 步放进去的文件和目录
-2. 用备份还原 `chat-completions.js`
-3. 重启酒馆
+```bash
+node install.mjs <ST_ROOT> --uninstall
+```
 
-`data/default-user/latency-monitor/` 里的历史记录不会自动删，不需要就手动删。
+会从备份还原 `chat-completions.js`，并删掉装进去的六处文件和目录。之后重启酒馆。
+
+手动卸载的话：删掉第 1、2、3 步放进去的文件和目录，用备份还原 `chat-completions.js`，重启。
+
+两种方式都**不会**动 `data/default-user/latency-monitor/` 里的历史记录，不需要就自己删。

@@ -4,6 +4,10 @@ import express from 'express';
 
 import { getMonitorRuntimeStatus } from '../settings-ui/service/monitor-runtime-status.js';
 import {
+    chatCompletionsPatchTarget,
+    inspectChatCompletionsPatches,
+} from '../shared/chat-completions-patch.js';
+import {
     getMonitorSettingsFilePath,
     readMonitorSettings,
     updateMonitorSettings,
@@ -36,6 +40,30 @@ const MAX_FORCE_STOP_DIAGNOSTICS_BYTES = 32 * 1024;
 // 全量 5000+ 条一次返回依然是好几 MB，没有任何视图需要这么多。
 // 筛选已经下沉到服务端，命中筛选后的结果集远小于这个上限。
 const MAX_RUNS_PAGE_LIMIT = 2000;
+
+// 本体源码有一百多 KB，而 /status 是前端轮询的接口，不能每次都整个读一遍。
+// 按 mtime 缓存：文件没动就直接用上次的结论，动过了才重新读。
+let patchInspectionCache = { mtimeMs: -1, result: null };
+
+// 只装了前端、没打本体补丁时，面板一切正常但记录永远是空的，而且不报任何错。
+// 这是这个项目最容易踩的坑，所以让服务端自己把它检出来，别再靠文档提醒。
+async function inspectInstalledPatches() {
+    const target = path.join(process.cwd(), ...chatCompletionsPatchTarget.split('/'));
+
+    try {
+        const { mtimeMs } = await fs.stat(target);
+        if (mtimeMs !== patchInspectionCache.mtimeMs) {
+            patchInspectionCache = {
+                mtimeMs,
+                result: inspectChatCompletionsPatches(await fs.readFile(target, 'utf8')),
+            };
+        }
+        return patchInspectionCache.result;
+    } catch {
+        // 读不到本体源码（权限或路径不对）时不猜，让前端按"未知"处理。
+        return null;
+    }
+}
 
 function normalizeOptionalText(value) {
     return typeof value === 'string' && value.trim()
@@ -871,8 +899,13 @@ export async function init(router) {
     router.get('/status', async (req, res) => {
         const storedRuns = await countRuns();
         const runtimeStatus = await getMonitorRuntimeStatus(req);
+        const patchStatus = await inspectInstalledPatches();
         res.json({
             ok: true,
+            patch_state: patchStatus?.state ?? 'unknown',
+            patch_present_count: patchStatus?.present_count ?? null,
+            patch_total: patchStatus?.total ?? null,
+            patch_missing: patchStatus?.missing ?? [],
             plugin: info.id,
             version: info.version,
             stored_runs: storedRuns,

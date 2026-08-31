@@ -7130,13 +7130,46 @@ function buildRunHtml(run, { compactSummary = false, showWaitingQueueAction = tr
     `;
 }
 
+// 只装前端、没给本体打补丁时，面板一切正常但永远没有记录，而且接口全返回 200。
+// 这是这个项目最常见的安装事故，后端会在 /status 里自报补丁状态，这里把它说清楚。
+function buildPatchInstallWarningHtml() {
+    const state_ = state.status?.patch_state;
+
+    if (state_ === 'absent') {
+        return `<div class="stlp-empty stlp-empty-alert">
+            <strong>后端补丁没有安装</strong>
+            没有它，酒馆不会把任何生成数据交给监控，所以记录会一直是空的。
+            在服务器上执行 <code>node install.mjs &lt;酒馆根目录&gt;</code> 后重启酒馆即可。
+        </div>`;
+    }
+
+    if (state_ === 'partial') {
+        const missing = Array.isArray(state.status?.patch_missing) ? state.status.patch_missing : [];
+        const detail = missing
+            .map((item) => `<li>${escapeHtml(item.label)}——${escapeHtml(item.impact)}</li>`)
+            .join('');
+        return `<div class="stlp-empty stlp-empty-alert">
+            <strong>后端补丁只装了一部分</strong>
+            ${escapeHtml(String(state.status?.patch_present_count ?? '?'))} / ${escapeHtml(String(state.status?.patch_total ?? '?'))} 处已就位，缺少的部分：
+            <ul>${detail}</ul>
+            重新执行 <code>node install.mjs &lt;酒馆根目录&gt;</code> 会只补缺的那几处。
+        </div>`;
+    }
+
+    return '';
+}
+
 function renderRuns() {
     const currentChatName = getTrackedCurrentChatWindowName();
     const runsView = getMonitorRunsView();
     const filterLabel = escapeHtml(getRunFilterLabel(runsView.filters));
 
+    const patchWarning = buildPatchInstallWarningHtml();
+
     if (!runsView.filtered && !runsView.runs.length) {
-        return `<div class="stlp-empty">当前还没有后台监控记录。发送一轮消息后，这里会显示最近 ${HISTORY_PREVIEW_COUNT} 条生成详情。</div>`;
+        // 补丁没装好时，"发送一轮消息就会有"是错的，别让人白等。
+        return patchWarning
+            || `<div class="stlp-empty">当前还没有后台监控记录。发送一轮消息后，这里会显示最近 ${HISTORY_PREVIEW_COUNT} 条生成详情。</div>`;
     }
 
     let matchedRuns = sortRunsByStartedAtDesc(runsView.runs);
@@ -7182,7 +7215,8 @@ function renderRuns() {
         ? `<div class="stlp-note">已按「${filterLabel}」从全部历史中筛出 ${escapeHtml(matchedCount)} 条${runsView.ready ? "" : "（仍在同步全部历史）"}，下方最多显示 ${escapeHtml(HISTORY_PREVIEW_COUNT)} 条。上方汇总仍为全局统计。</div>`
         : "";
 
-    return filterNote + groupRunsByChatName(visibleRuns)
+    // 补丁只装了一半时照样有记录，但记录本身是残缺的，所以这条提示要一直挂在列表上方。
+    return patchWarning + filterNote + groupRunsByChatName(visibleRuns)
         .map((group) => `
             <section class="stlp-run-group">
                 <div class="stlp-run-group-title">
