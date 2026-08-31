@@ -14,15 +14,28 @@
 
 ## 安装
 
-**这个扩展需要手动修改 SillyTavern 本体的一个源码文件才能工作**，没有一键安装。
+**这个扩展需要修改 SillyTavern 本体的一个源码文件才能工作。** 在跑酒馆的那台机器上：
 
-完整步骤见 [`docs/installation.md`](docs/installation.md)。
+```bash
+git clone https://github.com/mescolare-bot/ST-Aquarium-bubble-timer-sillytavern-latency-monitor.git
+cd ST-Aquarium-bubble-timer-sillytavern-latency-monitor
+node install.mjs <酒馆根目录>
+```
+
+然后重启酒馆，浏览器按 `Ctrl + Shift + R` 强制刷新。脚本是幂等的，升级酒馆之后重跑一次即可；
+`--dry-run` 只报告不落盘，`--uninstall` 可以完整还原。
+
+完整说明和手动安装步骤见 [`docs/installation.md`](docs/installation.md)。
 
 最容易踩的坑先说在前面：
 
-- 漏打本体补丁的话，面板打得开、插件也加载成功，但**记录永远是空的，且没有任何报错**
-- `settings-ui/` 和 `shared/` 这两个目录**同一份要放两个位置**，少一个酒馆起不来
+- **不能只在酒馆界面里贴仓库地址装。** 那样只装得上前端，后端和补丁都不会装，
+  结果是面板打得开、插件也加载成功，但记录永远是空的。安装必须在服务器上跑，
+  因为浏览器写不了 `src/`、`plugins/` 和 `config.yaml`
+- `settings-ui/` 和 `shared/` 这两个目录**同一份要放两个位置**，少一个酒馆起不来（脚本会处理）
 - 更新之后必须 `Ctrl + Shift + R` 强制刷新，否则浏览器还在跑旧缓存
+
+补丁没装全时面板会直接在记录列表上方报出来，包括缺了哪几处、各自会导致什么后果。
 
 ## 仓库结构
 

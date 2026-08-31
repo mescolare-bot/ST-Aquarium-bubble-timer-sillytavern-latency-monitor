@@ -956,6 +956,35 @@ body.stlp-page-host-open {
     line-height: 1.6;
 }
 
+/* 安装没做完的提示，是唯一一种"面板看着正常但其实用不了"的情况，要压过常规空状态的弱化样式。 */
+.stlp-empty-alert {
+    opacity: 1;
+    margin-bottom: 10px;
+    padding: 10px 12px;
+    border: 1px solid rgba(255, 138, 128, 0.55);
+    border-left-width: 3px;
+    border-radius: 6px;
+    background: rgba(255, 138, 128, 0.1);
+}
+
+.stlp-empty-alert strong {
+    display: block;
+    margin-bottom: 4px;
+}
+
+.stlp-empty-alert ul {
+    margin: 6px 0 0;
+    padding-left: 20px;
+}
+
+.stlp-empty-alert code {
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: rgba(127, 127, 127, 0.22);
+    font-size: 0.94em;
+    word-break: break-all;
+}
+
 .stlp-page-dialog,
 .stlp-page-dialog button,
 .stlp-page-dialog input,
