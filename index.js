@@ -334,6 +334,15 @@ const state = {
     isRefreshing: false,
     isSaving: false,
     backendReady: false,
+    // 记录从哪来：full 走后端插件，lite 走浏览器本地采集。
+    // unknown 表示还没探测完，此时不采集，避免和后端重复记一遍。
+    recordSourceMode: "unknown",
+    // 精简模式下正在进行的那条记录，停止按钮要靠它打"用户主动停止"的标记。
+    liteActiveRun: null,
+    // 从精简版升级到完整版之后，浏览器里那批旧记录不会自动消失，但面板改读后端就看不见了。
+    // 这两个字段负责把它们摆到明面上，而不是让用户以为数据没了。
+    legacyLiteRunCount: 0,
+    legacyLiteViewing: false,
     apiStatus: "正在连接后台监控接口",
     apiError: "",
     refreshTimerId: null,
@@ -1319,6 +1328,15 @@ function captureForceStopDiagnosticsSnapshot(phase) {
 // 服务端看到的错误文本对"用户主动停止"和"连接意外断开"完全一样（都是 socket 关闭触发的 abort），
 // 只能靠这个信号区分。必须赶在真正中止之前发出去，否则 run 已经落盘，信号就白发了。
 function sendClientStopSignal() {
+    // 精简模式下这条记录就在本进程里，直接打标记即可，不需要绕一圈发给后端。
+    // 临时查看旧记录时不算，那种情况下真正在记录的仍然是后端。
+    if (state.recordSourceMode === "lite" && !state.legacyLiteViewing) {
+        if (state.liteActiveRun) {
+            state.liteActiveRun.client_stopped = true;
+        }
+        return Promise.resolve();
+    }
+
     const clientGenerationId = state.currentGenerationClientId;
     if (!clientGenerationId) {
         return Promise.resolve();
@@ -1621,7 +1639,12 @@ function buildSectionTitleHtml(title, purpose = getActiveRequestPurpose()) {
 }
 
 function getBackendStatusIndicatorClass() {
-    return state.backendReady ? "stlp-status-connected" : "stlp-status-disconnected";
+    if (!state.backendReady) {
+        return "stlp-status-disconnected";
+    }
+
+    // 精简模式一切正常，但它和"后端接通了"不是一回事，指示灯要能看出来。
+    return state.recordSourceMode === "lite" ? "stlp-status-lite" : "stlp-status-connected";
 }
 
 function getRequestPurposeLabel(value) {
@@ -4861,7 +4884,149 @@ function areAllHistoryRunsSelected(runs = state.historyRuns) {
     return visibleRunIds.length > 0 && visibleRunIds.every((runId) => state.selectedHistoryRunIds.has(runId));
 }
 
+// 贴 git 安装的用户没有后端插件，酒馆会对插件路径返回 404；而装了后端、只是酒馆挂了
+// 的情况是网络异常或 5xx。这两者必须分开——前者是"本来就这么装的"，后者是故障。
+async function detectRecordSourceMode() {
+    // 手动覆盖：装了后端的机器永远探测成 full，没有这个开关就没法在真机上验精简形态，
+    // 排查用户问题时也可以让对方临时切过去比对。localStorage 里写 lite 或 full 即可。
+    try {
+        const override = window.localStorage?.getItem(`${MODULE_NAME}:record-source-mode`);
+        if (override === "lite" || override === "full") {
+            return override;
+        }
+    } catch {
+        // 读不到 localStorage 就照常探测。
+    }
+
+    try {
+        const response = await fetch(`${BACKEND_BASE}/status`, { credentials: "same-origin" });
+
+        // 插件各自挂在 /api/plugins/<id> 上，没有通配兜底，所以路由不存在就是没装后端。
+        if (response.status === 404) {
+            return "lite";
+        }
+
+        if (response.ok) {
+            return "full";
+        }
+
+        // 401/403/5xx 既不能证明装了也不能证明没装——可能只是还没登录，或者酒馆正在出错。
+        // 这里不下结论，留给下次再探，免得把一次性故障固化成形态判断。
+        return "unknown";
+    } catch {
+        return "unknown";
+    }
+}
+
+async function ensureRecordSourceMode() {
+    if (state.recordSourceMode === "unknown") {
+        state.recordSourceMode = await detectRecordSourceMode();
+    }
+    return state.recordSourceMode;
+}
+
+// 刻意用动态 import 而不是顶部静态 import：完整安装的用户目录里没有 lite/，
+// 静态 import 会在模块加载阶段就失败，把整个扩展一起带崩。按需加载就只影响精简形态。
+let liteModulesPromise = null;
+
+function loadLiteModules() {
+    if (!liteModulesPromise) {
+        liteModulesPromise = Promise.all([
+            import("./lite/local-api.js"),
+            import("./lite/run-store.js"),
+            import("./lite/run-recorder.js"),
+        ]).then(([api, store, recorder]) => ({ api, store, recorder }));
+    }
+
+    return liteModulesPromise;
+}
+
+let liteRunStorePromise = null;
+
+// 旧记录的查看/导出/清除只用得着存储层，而 run-store.js 是零依赖的，
+// 所以完整安装只需要多带这一个文件。这里不能走 loadLiteModules()——
+// 它会一次性 import 三个模块，缺任何一个都失败，结果就是完整形态下
+// 永远数不到旧记录，设置里那条提示等于白写。
+function loadLiteRunStore() {
+    if (!liteRunStorePromise) {
+        liteRunStorePromise = import("./lite/run-store.js");
+    }
+
+    return liteRunStorePromise;
+}
+
+// 升级到完整版之后，之前存在浏览器里的记录还在，只是面板不再读它们。
+// 这里数一下有多少条，好在设置里明说，而不是让人以为数据凭空没了。
+// 完整安装的用户目录里可能压根没有 lite/，import 失败就当作没有旧记录。
+async function refreshLegacyLiteRunCount() {
+    if (state.recordSourceMode !== "full") {
+        return;
+    }
+
+    try {
+        const store = await loadLiteRunStore();
+        state.legacyLiteRunCount = await store.countRuns();
+    } catch {
+        state.legacyLiteRunCount = 0;
+    }
+}
+
+async function exportLegacyLiteRuns() {
+    try {
+        const store = await loadLiteRunStore();
+        const runs = await store.readAllRuns();
+        const blob = new Blob([JSON.stringify(runs, null, 2)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = `st-latency-monitor-lite-${new Date().toISOString().slice(0, 10)}.json`;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+        state.apiStatus = `已导出 ${runs.length} 条旧的本地记录`;
+    } catch (error) {
+        state.apiStatus = "导出旧的本地记录失败";
+        state.apiError = error instanceof Error ? error.message : String(error);
+    }
+    safeRenderPage();
+}
+
+async function clearLegacyLiteRuns() {
+    if (!window.confirm(`确定要删除浏览器里这 ${state.legacyLiteRunCount} 条旧记录吗？删掉之后无法恢复，建议先导出。`)) {
+        return;
+    }
+
+    try {
+        const store = await loadLiteRunStore();
+        const result = await store.clearRuns("all", []);
+        state.legacyLiteRunCount = 0;
+        state.apiStatus = `已删除 ${result.deletedCount} 条旧的本地记录`;
+    } catch (error) {
+        state.apiStatus = "删除旧的本地记录失败";
+        state.apiError = error instanceof Error ? error.message : String(error);
+    }
+    safeRenderPage();
+}
+
+// 临时把面板切到读本地记录。不做数据合并——前端记的耗时含酒馆自身的处理时间，
+// 和后端的口径不是一回事，混进同一份平均值里出来的数字谁也不代表。
+function toggleLegacyLiteViewing(viewing) {
+    state.legacyLiteViewing = viewing;
+    state.recordSourceMode = viewing ? "lite" : "full";
+    void refreshBackendData();
+}
+
 async function fetchJson(path, options) {
+    if (state.recordSourceMode === "lite") {
+        const { api } = await loadLiteModules();
+        const localResult = await api.handleLocalRequest(path, options);
+        // 返回 null 表示本地不接管这个路径，照常走网络。
+        if (localResult !== null) {
+            return localResult;
+        }
+    }
+
     const stRequestHeadersFactory = await getSillyTavernRequestHeadersFactory();
     const stRequestHeaders = typeof stRequestHeadersFactory === "function"
         ? stRequestHeadersFactory({ omitContentType: !options?.body })
@@ -5318,6 +5483,116 @@ function parseGenerationRequestBody(init) {
     }
 }
 
+// 精简模式没有后端补丁，流式请求的 token 用量只能靠给自定义接口注入
+// stream_options.include_usage 拿到（chat-completions.js:2343 的 custom_include_body
+// 是唯一透传口，openai 源没有对应入口，那种组合下拿不到用量）。
+// 但第三方中转不保证认这个字段，所以按接口记住支不支持，别拿用户的正常生成反复试错。
+const USAGE_INJECTION_STORAGE_KEY = `${MODULE_NAME}:usage-injection`;
+const USAGE_INJECTION_YAML = "stream_options:\n  include_usage: true\n";
+
+function readUsageInjectionSupportMap() {
+    try {
+        const raw = window.localStorage?.getItem(USAGE_INJECTION_STORAGE_KEY);
+        const parsed = raw ? JSON.parse(raw) : null;
+        return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+        return {};
+    }
+}
+
+function readUsageInjectionSupport(endpoint) {
+    const value = readUsageInjectionSupportMap()[endpoint];
+    return value === "supported" || value === "unsupported" ? value : "unknown";
+}
+
+function writeUsageInjectionSupport(endpoint, support) {
+    if (!endpoint) {
+        return;
+    }
+
+    try {
+        const map = readUsageInjectionSupportMap();
+        map[endpoint] = support;
+        window.localStorage?.setItem(USAGE_INJECTION_STORAGE_KEY, JSON.stringify(map));
+    } catch {
+        // 存不下最多退回每次探测，不值得为此打断生成。
+    }
+}
+
+function getUsageInjectionEndpoint(requestBody) {
+    return typeof requestBody?.custom_url === "string" ? requestBody.custom_url.trim() : "";
+}
+
+function shouldInjectUsageOptions(requestBody) {
+    // 形态还没探测出来时不注入。为此等探测结果会把生成卡在一个网络请求后面，
+    // 代价比漏掉首次生成的 token 数大得多。
+    if (state.recordSourceMode !== "lite" || state.legacyLiteViewing) {
+        return false;
+    }
+
+    if (requestBody?.chat_completion_source !== "custom" || requestBody?.stream !== true) {
+        return false;
+    }
+
+    // 用户自己填过"附加参数"就完全不碰。mergeObjectWithYaml（util.js:821）在解析失败时
+    // 是 catch 后静默丢弃整段的，拼坏了会把用户自己的配置一起弄没，且毫无报错。
+    if (typeof requestBody?.custom_include_body === "string" && requestBody.custom_include_body.trim()) {
+        return false;
+    }
+
+    const endpoint = getUsageInjectionEndpoint(requestBody);
+    return Boolean(endpoint) && readUsageInjectionSupport(endpoint) !== "unsupported";
+}
+
+function buildUsageInjectedInit(init, requestBody) {
+    return {
+        ...init,
+        body: JSON.stringify({ ...requestBody, custom_include_body: USAGE_INJECTION_YAML }),
+    };
+}
+
+// 注入后报错不能直接归罪于注入——余额、密钥、限流都会报错。
+// 只有"去掉注入重试一次就成功"才算实锤，这时才把接口标成不支持。
+// 流式分支走的是 forwardFetchResponse（util.js:709），上游状态码会原样透传，
+// 所以这里可以直接看 response.ok。
+async function fetchWithUsageInjectionFallback(originalFetch, input, init, requestBody) {
+    const endpoint = getUsageInjectionEndpoint(requestBody);
+    const injectedInit = buildUsageInjectedInit(init, requestBody);
+
+    // 已经确认支持的接口不再探测，额外开销归零。
+    if (readUsageInjectionSupport(endpoint) === "supported") {
+        return originalFetch(input, injectedInit);
+    }
+
+    const response = await originalFetch(input, injectedInit);
+    if (response.ok) {
+        writeUsageInjectionSupport(endpoint, "supported");
+        return response;
+    }
+
+    // 用户已经点了停止就别再补一枪。
+    if (init?.signal?.aborted) {
+        return response;
+    }
+
+    const retryResponse = await originalFetch(input, init);
+    if (retryResponse.ok) {
+        writeUsageInjectionSupport(endpoint, "unsupported");
+    }
+
+    return retryResponse;
+}
+
+// 记录必须拿到最终那个响应，否则降级重试会被记成两条。
+function performGenerationFetch(originalFetch, input, init) {
+    const requestBody = parseGenerationRequestBody(init);
+    if (requestBody && shouldInjectUsageOptions(requestBody)) {
+        return fetchWithUsageInjectionFallback(originalFetch, input, init, requestBody);
+    }
+
+    return Promise.resolve(originalFetch(input, init));
+}
+
 function hasExplicitPluginRequestMetadata(requestBody) {
     return Boolean(
         (typeof requestBody?.request_plugin === "string" && requestBody.request_plugin.trim())
@@ -5349,6 +5624,57 @@ function shouldTrackAbortableChatGenerationRequest(input, init, patchedInit) {
     return true;
 }
 
+// 精简模式的采集入口：把这次生成从请求体一路记到流结束。
+// 整段都是旁路——读的是 response.clone()，任何失败都只写一行警告，
+// 绝不能影响酒馆自己那条链路，记录丢一条远比生成失败可接受。
+function recordLiteGeneration(effectiveInit, responsePromise) {
+    // 已经确定是完整形态就立刻返回，不给主链路增加任何无谓开销。
+    // legacyLiteViewing 只是把面板临时切去读旧记录，装的仍然是后端形态，
+    // 这时候再往浏览器里记一份就成了双写。
+    if (state.recordSourceMode === "full" || state.legacyLiteViewing) {
+        return;
+    }
+
+    // 后面可能要等形态探测，开始时间必须在这里取，否则等待时长会被算进这次生成的耗时。
+    const startedAtMs = Date.now();
+
+    void (async () => {
+        let run = null;
+        try {
+            // 页面刚打开时探测未必回来了，这里等它。不等的话开头几秒的生成会被静默丢掉。
+            if (await ensureRecordSourceMode() !== "lite") {
+                return;
+            }
+
+            const requestBody = parseGenerationRequestBody(effectiveInit);
+            if (!requestBody) {
+                return;
+            }
+
+            const { api, store, recorder } = await loadLiteModules();
+            run = recorder.createLiteRun(requestBody, startedAtMs);
+            state.liteActiveRun = run;
+
+            try {
+                const response = await responsePromise;
+                recorder.markLiteResponseHeaders(run, response);
+                await recorder.consumeLiteResponse(run, response.clone());
+            } catch (error) {
+                recorder.markLiteRunError(run, error);
+            }
+
+            recorder.finalizeLiteRun(run, await api.readLiteSettings());
+            await store.appendRun(run);
+        } catch (error) {
+            console.warn(`[${MODULE_NAME}] 本地记录这次生成失败`, error);
+        } finally {
+            if (run && state.liteActiveRun === run) {
+                state.liteActiveRun = null;
+            }
+        }
+    })();
+}
+
 function installOutgoingGenerationHook() {
     if (state.outgoingGenerationHookInstalled || typeof window.fetch !== "function") {
         return;
@@ -5360,13 +5686,18 @@ function installOutgoingGenerationHook() {
             const patchedInit = buildPatchedGenerationRequestInit(init);
             const effectiveInit = patchedInit ?? init;
             if (!shouldTrackAbortableChatGenerationRequest(input, effectiveInit, patchedInit)) {
-                return originalFetch(input, effectiveInit);
+                // 这类请求不进"可中止"跟踪，但它同样是一次真实生成，精简模式要记下来。
+                const untrackedResponse = performGenerationFetch(originalFetch, input, effectiveInit);
+                recordLiteGeneration(effectiveInit, untrackedResponse);
+                return untrackedResponse;
             }
             const requestEntry = registerActiveGenerationRequest();
             const trackedInit = buildTrackedGenerationRequestInit(input, init, effectiveInit, requestEntry);
 
             try {
-                return Promise.resolve(originalFetch(input, trackedInit)).then((response) => {
+                const responsePromise = performGenerationFetch(originalFetch, input, trackedInit);
+                recordLiteGeneration(effectiveInit, responsePromise);
+                return responsePromise.then((response) => {
                     monitorGenerationResponseLifecycle(response, requestEntry.requestId);
                     return response;
                 }, (error) => {
@@ -5463,6 +5794,9 @@ async function refreshBackendData({ silent = false } = {}) {
         return;
     }
 
+    // 必须在发第一个请求之前定下形态，否则 fetchJson 不知道该走本地还是走网络。
+    await ensureRecordSourceMode();
+
     state.isRefreshing = true;
     if (!silent) {
         state.apiStatus = "正在刷新后台监控数据";
@@ -5539,10 +5873,15 @@ async function refreshBackendData({ silent = false } = {}) {
         );
         state.backendReady = true;
         state.apiError = "";
-        state.apiStatus = "后端监控接口已连接";
+        state.apiStatus = state.recordSourceMode === "lite"
+            ? "精简模式：记录存在本机浏览器里"
+            : "后端监控接口已连接";
     } catch (error) {
         state.backendReady = false;
-        state.apiStatus = "后端监控接口不可用";
+        // 精简模式下走不通不是"后端不可用"——压根没有后端，说错了会让人白去查服务器。
+        state.apiStatus = state.recordSourceMode === "lite"
+            ? "本地记录读取失败"
+            : "后端监控接口不可用";
         state.apiError = error instanceof Error ? error.message : String(error);
     } finally {
         refreshChatWindowContext();
@@ -6511,6 +6850,7 @@ function buildSettingsContentHtml() {
     ];
 
     return `
+            ${buildLegacyLiteRunsNoticeHtml()}
             <div class="stlp-settings-view-note">设置项已经按功能归类，点开对应分区就能直接调整。</div>
             <div class="stlp-settings-category-list">
                 ${categoryCards.map((item) => {
@@ -6529,6 +6869,34 @@ function buildSettingsContentHtml() {
                 }).join("")}
             </div>
     `;
+}
+
+// 升级到完整版之后，精简模式那批记录还躺在浏览器里但面板不再读它们。
+// 不声不响地让它们消失最糟糕——用户只会觉得"数据丢了"。这里把它摆出来并给出去路。
+function buildLegacyLiteRunsNoticeHtml() {
+    if (state.legacyLiteViewing) {
+        return `<div class="stlp-empty stlp-empty-alert">
+            <strong>正在查看升级前的本地记录</strong>
+            这些是精简模式时记在浏览器里的，耗时口径和后端不同（含酒馆自身的处理时间），所以没有并进统计。
+            <div class="stlp-legacy-lite-actions">
+                <button class="menu_button stlp-inline-button" type="button" data-action="legacy-lite-view-off">切回后端记录</button>
+            </div>
+        </div>`;
+    }
+
+    if (state.recordSourceMode !== "full" || state.legacyLiteRunCount <= 0) {
+        return "";
+    }
+
+    return `<div class="stlp-empty stlp-empty-alert">
+        <strong>浏览器里还留着 ${escapeHtml(String(state.legacyLiteRunCount))} 条旧记录</strong>
+        这是你装后端之前、精简模式记下来的。它们的耗时口径和后端不一样，混进统计会让平均值失真，所以这里不会自动合并。
+        <div class="stlp-legacy-lite-actions">
+            <button class="menu_button stlp-inline-button" type="button" data-action="legacy-lite-view-on">单独查看</button>
+            <button class="menu_button stlp-inline-button" type="button" data-action="legacy-lite-export">导出为 JSON</button>
+            <button class="menu_button stlp-inline-button" type="button" data-action="legacy-lite-clear">清除</button>
+        </div>
+    </div>`;
 }
 
 function buildSettingsViewHtml() {
@@ -7927,6 +8295,21 @@ function handlePanelAction(actionTarget, event) {
     const sectionKey = actionTarget.dataset.sectionKey || "";
     const insidePage = Boolean(actionTarget.closest("#stlp_page"));
     const insideHistoryDialog = Boolean(actionTarget.closest(".stlp-history-dialog"));
+
+    if (action === "legacy-lite-view-on" || action === "legacy-lite-view-off") {
+        toggleLegacyLiteViewing(action === "legacy-lite-view-on");
+        return true;
+    }
+
+    if (action === "legacy-lite-export") {
+        void exportLegacyLiteRuns();
+        return true;
+    }
+
+    if (action === "legacy-lite-clear") {
+        void clearLegacyLiteRuns();
+        return true;
+    }
 
     if (action === "pricing-cycle-currency") {
         const modelName = typeof actionTarget?.dataset.pricingModel === "string"
@@ -9496,6 +9879,9 @@ function init() {
             saveUiSettings();
             pendingUiSettingsMigrationSave = false;
         }
+        // 尽早开始探测形态：记录不应该等面板初始化完才开始，
+        // 否则页面刚打开就发起的那次生成会被漏掉。
+        void ensureRecordSourceMode().then(() => refreshLegacyLiteRunCount());
         installGenerationSettingsHook();
         installOutgoingGenerationHook();
         bindUiEvents();

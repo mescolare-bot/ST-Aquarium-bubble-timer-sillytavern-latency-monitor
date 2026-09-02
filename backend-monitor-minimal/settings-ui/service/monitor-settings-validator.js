@@ -290,7 +290,9 @@ function normalizeSection(sectionName, inputSection, schemaSection, targetSectio
 
 export function resolvePermissionLevel(settings = {}, fallback = 'local_full') {
     const runtimeMode = settings?.runtime?.runtime_mode;
-    const envPermissionLevel = typeof process.env.ST_MONITOR_PERMISSION_LEVEL === 'string'
+    // 纯前端形态下这个文件会被浏览器直接 import，那里没有 process，
+    // 少了这层判断整条 import 链会在加载阶段就抛 ReferenceError。
+    const envPermissionLevel = typeof process !== 'undefined' && typeof process.env?.ST_MONITOR_PERMISSION_LEVEL === 'string'
         ? process.env.ST_MONITOR_PERMISSION_LEVEL.trim()
         : '';
 
