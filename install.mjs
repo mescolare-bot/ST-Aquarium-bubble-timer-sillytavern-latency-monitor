@@ -63,6 +63,9 @@ const COPY_PLAN = [
     { from: 'index.js', to: `public/scripts/extensions/third-party/${EXTENSION_DIR_NAME}/index.js` },
     { from: 'style.css', to: `public/scripts/extensions/third-party/${EXTENSION_DIR_NAME}/style.css` },
     { from: 'manifest.json', to: `public/scripts/extensions/third-party/${EXTENSION_DIR_NAME}/manifest.json` },
+    // 精简版攒在浏览器 IndexedDB 里的记录，升级后要能查看/导出/清除，靠的就是这个
+    // 零依赖的存储层。不带上它，设置里"还剩 N 条旧记录"的提示永远不会出现。
+    { from: 'lite/run-store.js', to: `public/scripts/extensions/third-party/${EXTENSION_DIR_NAME}/lite/run-store.js` },
     { from: 'backend-monitor-minimal/latency-monitor.js', to: 'src/latency-monitor.js' },
     { from: 'backend-monitor-minimal/server-plugin/index.js', to: `plugins/${PLUGIN_DIR_NAME}/index.js` },
     { from: 'backend-monitor-minimal/server-plugin/package.json', to: `plugins/${PLUGIN_DIR_NAME}/package.json` },
@@ -108,8 +111,57 @@ function copyRecursive(from, to) {
     fs.copyFileSync(from, to);
 }
 
+function readManifestName(manifestPath) {
+    try {
+        return JSON.parse(fs.readFileSync(manifestPath, 'utf8'))?.name ?? '';
+    } catch {
+        return '';
+    }
+}
+
+// 在酒馆界面里贴 git 地址装的精简版，目录名取自仓库名
+//（src/endpoints/extensions.js 用 path.basename(url) 决定），和这里的
+// EXTENSION_DIR_NAME 不是一个。两个目录同时存在时酒馆会把扩展加载两遍：
+// 两个面板、两次 window.fetch 劫持、重复记录。升级时必须清掉。
+// 注意浏览器里的记录不在这些目录里（IndexedDB 按域名存），删目录不会丢数据。
+function findDuplicateExtensionInstalls(stRoot) {
+    const thirdParty = path.join(stRoot, 'public/scripts/extensions/third-party');
+    if (!fs.existsSync(thirdParty)) {
+        return [];
+    }
+
+    const manifestName = readManifestName(path.join(REPO_ROOT, 'manifest.json'));
+    if (!manifestName) {
+        return [];
+    }
+
+    return fs.readdirSync(thirdParty).filter((entry) => {
+        if (entry === EXTENSION_DIR_NAME) {
+            return false;
+        }
+
+        const dir = path.join(thirdParty, entry);
+        return fs.statSync(dir).isDirectory()
+            && readManifestName(path.join(dir, 'manifest.json')) === manifestName;
+    });
+}
+
+function removeDuplicateExtensionInstalls(stRoot) {
+    for (const entry of findDuplicateExtensionInstalls(stRoot)) {
+        if (dryRun) {
+            skip(`将删除重复安装 third-party/${entry}`);
+            continue;
+        }
+
+        fs.rmSync(path.join(stRoot, 'public/scripts/extensions/third-party', entry), { recursive: true, force: true });
+        warn(`已删除重复安装 third-party/${entry}（贴 git 地址装的那份，留着会被加载两遍；浏览器里的记录不受影响）`);
+    }
+}
+
 function placeFiles(stRoot) {
     console.log('\n[1/3] 放置文件');
+
+    removeDuplicateExtensionInstalls(stRoot);
 
     for (const item of COPY_PLAN) {
         const from = path.join(REPO_ROOT, item.from);
@@ -253,6 +305,7 @@ function uninstall(stRoot) {
 
     const targets = [
         `public/scripts/extensions/third-party/${EXTENSION_DIR_NAME}`,
+        ...findDuplicateExtensionInstalls(stRoot).map((entry) => `public/scripts/extensions/third-party/${entry}`),
         'src/latency-monitor.js',
         `plugins/${PLUGIN_DIR_NAME}`,
         'src/settings-ui',

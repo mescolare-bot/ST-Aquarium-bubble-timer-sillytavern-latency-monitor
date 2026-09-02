@@ -445,6 +445,12 @@ body.stlp-page-host-open {
     color: #ff6b6b;
 }
 
+/* 精简模式：一切正常，但记录只存在本机浏览器里。用琥珀色和"接通后端"的绿区分开，
+   免得用户以为自己已经装上了后端。红色仍然专门留给真正的故障。 */
+.stlp-minimized-button.stlp-status-lite {
+    color: #f0b429;
+}
+
 .stlp-minimized-button:hover {
     background: var(--stlp-minimized-bg-hover, transparent) !important;
     background-image: none !important;
@@ -1995,6 +2001,18 @@ body.stlp-page-host-open {
 .stlp-status-disconnected {
     background: #ff6b6b;
     box-shadow: none;
+}
+
+.stlp-status-lite {
+    background: #f0b429;
+    box-shadow: none;
+}
+
+.stlp-legacy-lite-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 10px;
 }
 
 .stlp-controls,
