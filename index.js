@@ -1647,6 +1647,17 @@ function getBackendStatusIndicatorClass() {
     return state.recordSourceMode === "lite" ? "stlp-status-lite" : "stlp-status-connected";
 }
 
+// 圆点本来只有颜色这一个表达渠道，色弱用户和第一次见的人都无从判断它在说什么。
+function getBackendStatusIndicatorLabel() {
+    if (!state.backendReady) {
+        return "连不上后端";
+    }
+
+    return state.recordSourceMode === "lite"
+        ? "精简版：记录只存在这个浏览器里"
+        : "完整版：已接通后端";
+}
+
 function getRequestPurposeLabel(value) {
     return REQUEST_PURPOSE_LABELS[value] || REQUEST_PURPOSE_LABELS.chat_main_reply;
 }
@@ -8001,7 +8012,7 @@ function buildPageHtml() {
                     <div class="stlp-page-header-copy">
                         <div class="stlp-page-title-row">
                             <div class="stlp-page-title">${escapeHtml(MODULE_DISPLAY_NAME)}</div>
-                            <span class="stlp-status-indicator ${escapeHtml(getBackendStatusIndicatorClass())} stlp-page-title-status" aria-hidden="true"></span>
+                            <span class="stlp-status-indicator ${escapeHtml(getBackendStatusIndicatorClass())} stlp-page-title-status" role="img" title="${escapeHtml(getBackendStatusIndicatorLabel())}" aria-label="${escapeHtml(getBackendStatusIndicatorLabel())}"></span>
                         </div>
                         ${compactTouchLayout ? `<div class="stlp-page-subtitle">${escapeHtml(pageSubtitle)}</div>` : ""}
                     </div>

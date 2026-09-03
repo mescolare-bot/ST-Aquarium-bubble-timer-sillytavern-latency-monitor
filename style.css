@@ -1992,8 +1992,11 @@ body.stlp-page-host-open {
     margin-top: 1px;
 }
 
+/* 三个状态各占一种色相，红色专留给故障。
+   曾经用琥珀色表示精简版，但琥珀和红挨得太近，一眼看过去像是在报警——
+   而精简版明明一切正常。现在绿色是"正常工作"，蓝色额外表示"还接通了后端"。 */
 .stlp-status-connected {
-    background: #4fd27f;
+    background: #4DB4FF;
     box-shadow: none;
 }
 
@@ -2003,7 +2006,7 @@ body.stlp-page-host-open {
 }
 
 .stlp-status-lite {
-    background: #f0b429;
+    background: #4fd27f;
     box-shadow: none;
 }
 
