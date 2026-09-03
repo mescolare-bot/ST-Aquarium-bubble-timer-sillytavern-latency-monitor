@@ -3211,9 +3211,32 @@ function getRunOutputEvidenceText(run) {
     return hasRunRecordedOutput(run) ? "已收到正文内容" : "未收到正文内容";
 }
 
+// 精简模式拿不到 token 的成因，对应 describeUsageCaptureMode 写在记录上的标记。
+// response_body 故意不列：非流式的用量本来就在响应体里，拿不到是真异常，
+// 给它配一句"正常解释"反而会盖住问题。
+const LITE_USAGE_UNAVAILABLE_NOTES = {
+    source_no_passthrough: "酒馆不向前端透传这个接入源的用量，改用自定义接口可解",
+    skipped_user_params: "你填了附加参数，插件没敢注入，以免弄坏你的配置",
+    injected: "这个接口不返回用量",
+};
+
+function getLiteUsageUnavailableNote(run) {
+    if (run?.record_source !== "frontend") {
+        return "";
+    }
+
+    // 改动之前记的老记录没有这个标记，查不到就退回原来的措辞，不硬编解释。
+    return LITE_USAGE_UNAVAILABLE_NOTES[run?.usage_capture] || "";
+}
+
 function getRunUsageEvidenceText(run, abnormalBilling, usageAvailable) {
     if (abnormalBilling?.hasUsageTokens || usageAvailable) {
         return "已拿到 usage";
+    }
+
+    const unavailableNote = getLiteUsageUnavailableNote(run);
+    if (unavailableNote) {
+        return `未拿到 usage：${unavailableNote}`;
     }
 
     return isAbnormalRun(run) ? "未拿到 usage" : "-";
@@ -5560,14 +5583,32 @@ function parseGenerationRequestBody(init) {
 // stream_options.include_usage 拿到（chat-completions.js:2343 的 custom_include_body
 // 是唯一透传口，openai 源没有对应入口，那种组合下拿不到用量）。
 // 但第三方中转不保证认这个字段，所以按接口记住支不支持，别拿用户的正常生成反复试错。
+//
+// 状态有四种，区别在于"为什么拿不到"：
+//   unknown     还没探过，注入并观察
+//   supported   注入后真的收到了 usage
+//   no_usage    接口收下了这个字段、请求也成功，但整条流里一个 usage 都没有
+//   unsupported 注入会让请求失败，去掉重试才成功
+// no_usage 和 unsupported 都停止注入，但成因不同，面板要分开说。
 const USAGE_INJECTION_STORAGE_KEY = `${MODULE_NAME}:usage-injection`;
 const USAGE_INJECTION_YAML = "stream_options:\n  include_usage: true\n";
+// v1 的 supported 是拿"请求没报错"判出来的，会把吞掉 usage 的中转误标成支持，
+// 而且一旦误标就永不复查。这种记录没有挽救价值，升级时整体丢弃重新探测。
+const USAGE_INJECTION_STATE_VERSION = 2;
 
 function readUsageInjectionSupportMap() {
     try {
         const raw = window.localStorage?.getItem(USAGE_INJECTION_STORAGE_KEY);
         const parsed = raw ? JSON.parse(raw) : null;
-        return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+            return {};
+        }
+        if (parsed.version !== USAGE_INJECTION_STATE_VERSION) {
+            return {};
+        }
+
+        const endpoints = parsed.endpoints;
+        return endpoints && typeof endpoints === "object" && !Array.isArray(endpoints) ? endpoints : {};
     } catch {
         return {};
     }
@@ -5575,7 +5616,7 @@ function readUsageInjectionSupportMap() {
 
 function readUsageInjectionSupport(endpoint) {
     const value = readUsageInjectionSupportMap()[endpoint];
-    return value === "supported" || value === "unsupported" ? value : "unknown";
+    return value === "supported" || value === "unsupported" || value === "no_usage" ? value : "unknown";
 }
 
 function writeUsageInjectionSupport(endpoint, support) {
@@ -5586,7 +5627,10 @@ function writeUsageInjectionSupport(endpoint, support) {
     try {
         const map = readUsageInjectionSupportMap();
         map[endpoint] = support;
-        window.localStorage?.setItem(USAGE_INJECTION_STORAGE_KEY, JSON.stringify(map));
+        window.localStorage?.setItem(USAGE_INJECTION_STORAGE_KEY, JSON.stringify({
+            version: USAGE_INJECTION_STATE_VERSION,
+            endpoints: map,
+        }));
     } catch {
         // 存不下最多退回每次探测，不值得为此打断生成。
     }
@@ -5596,7 +5640,9 @@ function getUsageInjectionEndpoint(requestBody) {
     return typeof requestBody?.custom_url === "string" ? requestBody.custom_url.trim() : "";
 }
 
-function shouldInjectUsageOptions(requestBody) {
+// "这次请求本来就该注入吗"——只看请求本身，不看历史探测结论。
+// 收尾判定要用它：那时 shouldInjectUsageOptions 可能已经因为刚写下的结论而翻成 false。
+function isUsageInjectionCandidate(requestBody) {
     // 形态还没探测出来时不注入。为此等探测结果会把生成卡在一个网络请求后面，
     // 代价比漏掉首次生成的 token 数大得多。
     if (state.recordSourceMode !== "lite" || state.legacyLiteViewing) {
@@ -5613,8 +5659,33 @@ function shouldInjectUsageOptions(requestBody) {
         return false;
     }
 
-    const endpoint = getUsageInjectionEndpoint(requestBody);
-    return Boolean(endpoint) && readUsageInjectionSupport(endpoint) !== "unsupported";
+    return Boolean(getUsageInjectionEndpoint(requestBody));
+}
+
+function shouldInjectUsageOptions(requestBody) {
+    if (!isUsageInjectionCandidate(requestBody)) {
+        return false;
+    }
+
+    const support = readUsageInjectionSupport(getUsageInjectionEndpoint(requestBody));
+    return support !== "unsupported" && support !== "no_usage";
+}
+
+// 精简模式拿 token 只有注入这一条路，走不通的成因有三种。分开记下来，
+// 面板才能说清楚是接口不给、还是用户自己的配置挡住了——只显示"-"的话，
+// 用户无从判断到底是谁的问题。
+function describeUsageCaptureMode(requestBody) {
+    if (requestBody?.stream !== true) {
+        // 非流式的 usage 直接在响应体里，不依赖注入。
+        return "response_body";
+    }
+    if (requestBody?.chat_completion_source !== "custom") {
+        return "source_no_passthrough";
+    }
+    if (typeof requestBody?.custom_include_body === "string" && requestBody.custom_include_body.trim()) {
+        return "skipped_user_params";
+    }
+    return "injected";
 }
 
 function buildUsageInjectedInit(init, requestBody) {
@@ -5632,14 +5703,11 @@ async function fetchWithUsageInjectionFallback(originalFetch, input, init, reque
     const endpoint = getUsageInjectionEndpoint(requestBody);
     const injectedInit = buildUsageInjectedInit(init, requestBody);
 
-    // 已经确认支持的接口不再探测，额外开销归零。
-    if (readUsageInjectionSupport(endpoint) === "supported") {
-        return originalFetch(input, injectedInit);
-    }
-
     const response = await originalFetch(input, injectedInit);
+    // 请求成功只说明接口没被这个字段噎住，不说明它真会回 usage——很多中转（假流式尤甚）
+    // 照单全收再一声不吭。所以 supported / no_usage 的结论留到流读完、
+    // 能看见 run.response_usage 的时候再下，见 recordUsageInjectionOutcome。
     if (response.ok) {
-        writeUsageInjectionSupport(endpoint, "supported");
         return response;
     }
 
@@ -5654,6 +5722,26 @@ async function fetchWithUsageInjectionFallback(originalFetch, input, init, reque
     }
 
     return retryResponse;
+}
+
+// 注入到底管不管用，只有这一处判得准：流已经读完，run.response_usage 是不是空的一目了然。
+// 放在发请求那一刻用 response.ok 判，会把"收下字段却不回 usage"的中转永久标成支持，
+// 此后不再复查，用户永远看到"-"还不知道为什么。
+function recordUsageInjectionOutcome(requestBody, run) {
+    if (!isUsageInjectionCandidate(requestBody)) {
+        return;
+    }
+
+    // 只有干净跑完的生成才作数。报错、被用户中止、非 200 本来就拿不到 usage，
+    // 拿这种样本下结论会把好接口误判成不给用量。
+    if (run?.error || run?.client_stopped || run?.http_status !== 200) {
+        return;
+    }
+
+    writeUsageInjectionSupport(
+        getUsageInjectionEndpoint(requestBody),
+        hasRunUsage(run) ? "supported" : "no_usage",
+    );
 }
 
 // 记录必须拿到最终那个响应，否则降级重试会被记成两条。
@@ -5726,6 +5814,9 @@ function recordLiteGeneration(effectiveInit, responsePromise) {
 
             const { api, store, recorder } = await loadLiteModules();
             run = recorder.createLiteRun(requestBody, startedAtMs);
+            // 拿不到 token 时面板要说明成因，而成因只有请求发出的那一刻才知道
+            // （事后从记录里反推不出用户当时填没填附加参数）。
+            run.usage_capture = describeUsageCaptureMode(requestBody);
             state.liteActiveRun = run;
 
             try {
@@ -5737,6 +5828,7 @@ function recordLiteGeneration(effectiveInit, responsePromise) {
             }
 
             recorder.finalizeLiteRun(run, await api.readLiteSettings());
+            recordUsageInjectionOutcome(requestBody, run);
             await store.appendRun(run);
         } catch (error) {
             console.warn(`[${MODULE_NAME}] 本地记录这次生成失败`, error);
