@@ -96,6 +96,9 @@ const DEFAULT_UI_SETTINGS = {
     minimizedButtonColorMode: "follow_theme",
     minimizedButtonCustomColor: "#67d98f",
     minimizedButtonStrokeColor: "#ffffff",
+    minimizedButtonBorderColor: "#c8ccd2",
+    minimizedButtonBorderVisible: true,
+    minimizedButtonOpacity: 1,
     minimizedButtonBackgroundMode: "mist",
     minimizedButtonPosition: null,
     runFloorMap: {},
@@ -255,6 +258,8 @@ const SETTINGS_CATEGORY_LABELS = {
     pricing: "价格估算",
     appearance: "外观与主题",
 };
+
+const MINIMIZED_BUTTON_OPACITY_MIN = 0.1;
 
 const MINIMIZED_BUTTON_COLOR_PRESETS = [
     { key: "mist_blue", label: "晨雾蓝", color: "#4F6A88" },
@@ -464,6 +469,9 @@ function loadUiSettings() {
             minimizedButtonColorMode: normalizeMinimizedButtonColorMode(parsed?.minimizedButtonColorMode),
             minimizedButtonCustomColor: normalizeMinimizedButtonCustomColor(parsed?.minimizedButtonCustomColor, parsed?.minimizedButtonColorMode),
             minimizedButtonStrokeColor: normalizeMinimizedButtonStrokeColor(parsed?.minimizedButtonStrokeColor),
+            minimizedButtonBorderColor: normalizeMinimizedButtonBorderColor(parsed?.minimizedButtonBorderColor),
+            minimizedButtonBorderVisible: normalizeMinimizedButtonBorderVisible(parsed?.minimizedButtonBorderVisible),
+            minimizedButtonOpacity: normalizeMinimizedButtonOpacity(parsed?.minimizedButtonOpacity),
             minimizedButtonBackgroundMode: normalizeMinimizedButtonBackgroundMode(parsed?.minimizedButtonBackgroundMode),
             minimizedButtonPosition: normalizeMinimizedButtonPosition(parsed?.minimizedButtonPosition),
             runFloorMap: parsed?.runFloorMap && typeof parsed.runFloorMap === "object" ? parsed.runFloorMap : {},
@@ -587,6 +595,43 @@ function normalizeMinimizedButtonStrokeColor(value) {
     return normalizeHexColor(value, DEFAULT_UI_SETTINGS.minimizedButtonStrokeColor);
 }
 
+function normalizeMinimizedButtonBorderColor(value) {
+    return normalizeHexColor(value, DEFAULT_UI_SETTINGS.minimizedButtonBorderColor);
+}
+
+// 只有明确存成 false 才算关掉：老配置里没有这个键，此时该沿用"有外圈"的既有外观。
+function normalizeMinimizedButtonBorderVisible(value) {
+    return value === undefined || value === null
+        ? DEFAULT_UI_SETTINGS.minimizedButtonBorderVisible
+        : Boolean(value);
+}
+
+// 下限 10%：这颗星是唯一能唤回面板的入口，允许调到 0 就等于让用户把自己锁在外面。
+function normalizeMinimizedButtonOpacity(value) {
+    // null 和空串必须当"没设过"处理：Number() 会把它们变成 0，再夹到下限就成了 10%，
+    // 等于设置一缺失图标就自己淡到几乎看不见。
+    if (value === null || value === undefined || value === "") {
+        return DEFAULT_UI_SETTINGS.minimizedButtonOpacity;
+    }
+
+    const numeric = typeof value === "number" ? value : Number(value);
+    if (!Number.isFinite(numeric)) {
+        return DEFAULT_UI_SETTINGS.minimizedButtonOpacity;
+    }
+
+    // 兼容按百分比存的旧值，也兼容直接传 0.1~1 的小数。
+    const ratio = numeric > 1 ? numeric / 100 : numeric;
+    if (!Number.isFinite(ratio)) {
+        return DEFAULT_UI_SETTINGS.minimizedButtonOpacity;
+    }
+
+    return Math.min(1, Math.max(MINIMIZED_BUTTON_OPACITY_MIN, Math.round(ratio * 100) / 100));
+}
+
+function getMinimizedButtonOpacityPercent() {
+    return Math.round(normalizeMinimizedButtonOpacity(state.uiSettings.minimizedButtonOpacity) * 100);
+}
+
 function normalizeMinimizedButtonBackgroundMode(value) {
     return Object.prototype.hasOwnProperty.call(MINIMIZED_BUTTON_BACKGROUND_MODE_LABELS, value)
         ? value
@@ -622,11 +667,21 @@ function getMinimizedButtonStrokeColorValue() {
     return normalizeMinimizedButtonStrokeColor(state.uiSettings.minimizedButtonStrokeColor);
 }
 
+function isMinimizedButtonBorderVisible() {
+    return normalizeMinimizedButtonBorderVisible(state.uiSettings.minimizedButtonBorderVisible);
+}
+
+function getMinimizedButtonBorderColorValue() {
+    return isMinimizedButtonBorderVisible()
+        ? normalizeMinimizedButtonBorderColor(state.uiSettings.minimizedButtonBorderColor)
+        : "transparent";
+}
+
 function getMinimizedButtonBackgroundValues() {
     return {
         background: "transparent",
         hoverBackground: "transparent",
-        borderColor: "transparent",
+        borderColor: getMinimizedButtonBorderColorValue(),
         shadow: "none",
     };
 }
@@ -1945,7 +2000,8 @@ function buildMinimizedButtonStyle() {
     const colorValue = getMinimizedButtonConnectedColorValue();
     const strokeColorValue = getMinimizedButtonStrokeColorValue();
     const backgroundValues = getMinimizedButtonBackgroundValues();
-    const baseStyle = `--stlp-minimized-connected:${colorValue};--stlp-minimized-stroke:${strokeColorValue};--stlp-minimized-bg:${backgroundValues.background};--stlp-minimized-bg-hover:${backgroundValues.hoverBackground};--stlp-minimized-border:${backgroundValues.borderColor};--stlp-minimized-shadow:${backgroundValues.shadow};`;
+    const opacityValue = normalizeMinimizedButtonOpacity(state.uiSettings.minimizedButtonOpacity);
+    const baseStyle = `--stlp-minimized-connected:${colorValue};--stlp-minimized-stroke:${strokeColorValue};--stlp-minimized-bg:${backgroundValues.background};--stlp-minimized-bg-hover:${backgroundValues.hoverBackground};--stlp-minimized-border:${backgroundValues.borderColor};--stlp-minimized-shadow:${backgroundValues.shadow};--stlp-minimized-opacity:${opacityValue};`;
 
     const position = normalizeMinimizedButtonPosition(state.uiSettings.minimizedButtonPosition);
     if (!position) {
@@ -7033,9 +7089,12 @@ function buildSettingsContentHtml() {
 
     const minimizedButtonCustomColor = normalizeMinimizedButtonCustomColor(state.uiSettings.minimizedButtonCustomColor);
     const minimizedButtonStrokeColor = normalizeMinimizedButtonStrokeColor(state.uiSettings.minimizedButtonStrokeColor);
+    const minimizedButtonBorderColor = normalizeMinimizedButtonBorderColor(state.uiSettings.minimizedButtonBorderColor);
+    const minimizedButtonBorderVisible = isMinimizedButtonBorderVisible();
+    const minimizedButtonOpacityPercent = getMinimizedButtonOpacityPercent();
     const isMinimizedButtonFollowingTheme = minimizedButtonColorMode === "follow_theme";
     const themeSummary = getThemeModeLabel(state.uiSettings.themeMode).replace("主题：", "");
-    const minimizedIconSummary = `${isMinimizedButtonFollowingTheme ? "主色跟随酒馆" : `主色 ${minimizedButtonCustomColor.toUpperCase()}`} · 描边 ${minimizedButtonStrokeColor.toUpperCase()}`;
+    const minimizedIconSummary = `${isMinimizedButtonFollowingTheme ? "主色跟随酒馆" : `主色 ${minimizedButtonCustomColor.toUpperCase()}`} · 描边 ${minimizedButtonStrokeColor.toUpperCase()} · 外圈 ${minimizedButtonBorderVisible ? minimizedButtonBorderColor.toUpperCase() : "已隐藏"} · 不透明度 ${minimizedButtonOpacityPercent}%`;
     const themeSubsectionBody = `
             <div class="stlp-segmented-control" role="group" aria-label="面板主题">
                 ${THEME_MODE_SEQUENCE.map((mode) => `
@@ -7064,7 +7123,26 @@ function buildSettingsContentHtml() {
                     <span class="stlp-color-wheel-value">${escapeHtml(minimizedButtonStrokeColor.toUpperCase())}</span>
                 </div>
             </label>
-            <div class="stlp-note">当前最小化图标颜色：${escapeHtml(isMinimizedButtonFollowingTheme ? "主色跟随酒馆主题配色" : minimizedButtonCustomColor.toUpperCase())}；描边 ${escapeHtml(minimizedButtonStrokeColor.toUpperCase())}。按钮背景是透明的，只有描边和图标本身会显示颜色。</div>
+            <label class="checkbox_label stlp-settings-toggle">
+                <input id="stlp_minimized_button_border_visible" type="checkbox" ${minimizedButtonBorderVisible ? "checked" : ""} />
+                <span>显示图标外圈</span>
+            </label>
+            <label class="stlp-color-wheel-field ${minimizedButtonBorderVisible ? "" : "is-disabled"}">
+                <span>外圈边框</span>
+                <div class="stlp-color-wheel-row">
+                    <input id="stlp_minimized_button_border_color" class="stlp-color-wheel-input" type="color" value="${escapeHtml(minimizedButtonBorderColor)}" ${minimizedButtonBorderVisible ? "" : "disabled"} />
+                    <span class="stlp-color-wheel-hint">图标外面那一圈细边</span>
+                    <span class="stlp-color-wheel-value">${escapeHtml(minimizedButtonBorderVisible ? minimizedButtonBorderColor.toUpperCase() : "已隐藏")}</span>
+                </div>
+            </label>
+            <label class="stlp-slider-field">
+                <span>整体不透明度</span>
+                <div class="stlp-slider-row">
+                    <input id="stlp_minimized_button_opacity" class="stlp-slider-input" type="range" min="${Math.round(MINIMIZED_BUTTON_OPACITY_MIN * 100)}" max="100" step="5" value="${minimizedButtonOpacityPercent}" />
+                    <span class="stlp-slider-value" data-stlp-opacity-value>${minimizedButtonOpacityPercent}%</span>
+                </div>
+            </label>
+            <div class="stlp-note">按钮背景本来就是透明的，能看见的只有星星、描边和外圈这三样，三者都能单独选色，外圈还可以整个关掉。不透明度最低 ${Math.round(MINIMIZED_BUTTON_OPACITY_MIN * 100)}%——它是唤回面板的唯一入口，留一点可见度才找得回来。后台连不上时图标会变红，这个红同样跟着不透明度走。</div>
     `;
     const appearanceContent = `
             <div class="stlp-settings-subtitle">外观与主题</div>
@@ -8464,6 +8542,31 @@ function handlePanelChangeTarget(target) {
         return true;
     }
 
+    if (target.id === "stlp_minimized_button_border_visible") {
+        state.uiSettings.minimizedButtonBorderVisible = Boolean(target.checked);
+        saveUiSettings();
+        safeRenderPage();
+        return true;
+    }
+
+    if (target.id === "stlp_minimized_button_border_color") {
+        state.uiSettings.minimizedButtonBorderColor = normalizeMinimizedButtonBorderColor(target.value);
+        saveUiSettings();
+        if (isColorWheelInputTarget(target)) {
+            deferColorWheelRenderUntilBlur();
+        } else {
+            safeRenderPage();
+        }
+        return true;
+    }
+
+    if (target.id === "stlp_minimized_button_opacity") {
+        state.uiSettings.minimizedButtonOpacity = normalizeMinimizedButtonOpacity(target.value);
+        saveUiSettings();
+        safeRenderPage();
+        return true;
+    }
+
     if (target.id === "stlp_abnormal_only" || target.id === "stlp_cache_hit_only") {
         if (target.id === "stlp_abnormal_only") {
             state.uiSettings.abnormalOnly = Boolean(target.checked);
@@ -9330,6 +9433,18 @@ function bindUiEvents() {
             }
 
             if (!target.closest("#stlp_page")) {
+                return;
+            }
+
+            if (target.id === "stlp_minimized_button_opacity") {
+                // 拖动过程中只更新数字，不走整页重渲染——重渲染会换掉正在拖的这个滑块，
+                // 手指还按着就断了。落值靠松手时的 change 事件。
+                state.uiSettings.minimizedButtonOpacity = normalizeMinimizedButtonOpacity(target.value);
+                saveUiSettings();
+                const valueLabel = target.closest(".stlp-slider-row")?.querySelector("[data-stlp-opacity-value]");
+                if (valueLabel) {
+                    valueLabel.textContent = `${getMinimizedButtonOpacityPercent()}%`;
+                }
                 return;
             }
 

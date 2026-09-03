@@ -408,7 +408,11 @@ body.stlp-page-host-open {
     height: 34px;
     min-height: 34px;
     padding: 0;
-    border: 1px solid var(--stlp-minimized-border, transparent);
+    /* 这三条都要 !important：按钮挂着酒馆的 .menu_button，特异性和这里完全相同，
+       只靠后加载抢不稳。酒馆那边给的是 border 深色描边和 filter: grayscale(0.5)，
+       后者会把用户在色轮里选的颜色削掉一半饱和度。 */
+    border: 1px solid var(--stlp-minimized-border, transparent) !important;
+    filter: none !important;
     border-radius: 999px;
     background: var(--stlp-minimized-bg, transparent) !important;
     background-image: none !important;
@@ -422,7 +426,7 @@ body.stlp-page-host-open {
     cursor: grab;
     touch-action: none;
     user-select: none;
-    opacity: 1;
+    opacity: var(--stlp-minimized-opacity, 1);
 }
 
 .stlp-minimized-icon-svg {
@@ -485,7 +489,7 @@ body.stlp-page-host-open {
 
     50% {
         transform: scale(1.09);
-        opacity: 1;
+        opacity: var(--stlp-minimized-opacity, 1);
         box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.94), 0 0 12px color-mix(in srgb, currentColor 36%, transparent), 0 12px 28px rgba(0, 0, 0, 0.22);
     }
 }
@@ -1632,7 +1636,8 @@ body.stlp-page-host-open {
     color: var(--stlp-toolbar-accent-text);
 }
 
-.stlp-color-wheel-field {
+.stlp-color-wheel-field,
+.stlp-slider-field {
     display: flex;
     flex-direction: column;
     gap: 8px;
@@ -1648,12 +1653,36 @@ body.stlp-page-host-open {
     opacity: 0.7;
 }
 
-.stlp-color-wheel-row {
+.stlp-color-wheel-row,
+.stlp-slider-row {
     display: flex;
     align-items: center;
     gap: 12px;
     flex-wrap: wrap;
     min-width: 0;
+}
+
+/* 靠 accent-color 拿主题色，省掉一整套 ::-webkit-slider-thumb 的跨浏览器适配。
+   border / background 要 !important，酒馆的 input 全局样式会给它加边框和底色。 */
+.stlp-slider-input {
+    flex: 1 1 150px;
+    min-width: 110px;
+    height: 22px;
+    margin: 0;
+    padding: 0;
+    border: 0 !important;
+    background: transparent !important;
+    box-shadow: none !important;
+    accent-color: var(--stlp-primary);
+    cursor: pointer;
+}
+
+.stlp-slider-value {
+    flex: 0 0 auto;
+    min-width: 3.4em;
+    text-align: right;
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    color: var(--stlp-panel-text);
 }
 
 .stlp-color-wheel-input {
