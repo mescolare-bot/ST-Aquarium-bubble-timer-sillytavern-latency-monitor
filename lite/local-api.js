@@ -27,6 +27,7 @@ import {
     clearRuns,
     countRuns,
     readAllRuns,
+    readArchivedRunStubs,
     readMeta,
     readRunById,
     updateRunById,
@@ -154,8 +155,13 @@ async function handleSummary(query) {
     const days = Math.max(1, Math.min(365, Number(query.days) || 14));
 
     const allRuns = await readAllRuns();
+    // 日聚合要覆盖超额后被归档的日子，所以额外把存根接上；
+    // 明细列表不接，存根里没有列表要显示的东西。
+    const dailySource = groupBy === 'day'
+        ? (await readArchivedRunStubs()).concat(allRuns)
+        : allRuns.slice(0, limit);
     const runs = filterRunsByChatKey(
-        filterRunsByPurpose(groupBy === 'day' ? allRuns : allRuns.slice(0, limit), requestedPurpose),
+        filterRunsByPurpose(dailySource, requestedPurpose),
         requestedChatKey,
     );
     const settings = await readLiteSettings();

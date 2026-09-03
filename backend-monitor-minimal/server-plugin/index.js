@@ -32,12 +32,31 @@ import {
     normalizeRequestPurpose,
     normalizeUsageValue,
     readRequestedFlag,
+    toArchivedRunStub,
     toClientRun,
     toClientRuns,
 } from '../shared/run-query.js';
 
 const LOG_DIR = path.join(process.cwd(), 'data', 'default-user', 'latency-monitor');
 const LOG_FILE = path.join(LOG_DIR, 'runs.jsonl');
+// 明细超额时被轮转出去的记录，压成只含统计字段的存根留在这里。
+// 只有日聚合读它——明细列表读了也没用，存根里没有排障要看的东西。
+const ARCHIVE_FILE = path.join(LOG_DIR, 'runs-archive.jsonl');
+// 整份重写先写这里再 rename，见 writeRunsFileAtomic。
+const RUNS_TMP_FILE = `${LOG_FILE}.tmp`;
+// 轮转跨了"追加存档"和"截短明细"两步，中间崩掉会两头不一致，用标记文件把它变成可回滚的。
+const ROTATE_MARKER_FILE = path.join(LOG_DIR, 'runs-rotate.marker.json');
+// runs.jsonl 会被整份读取并逐行 JSON.parse，代价随体积线性增长：
+// 实测 40.8 MB / 6628 条要 375 ms，面板每刷新一次就付一遍。
+// 留 3000 条约 13.5 MB / 45 ms，是"明细够查一个月"和"刷新不卡"之间的平衡点。
+const RUNS_RETAINED_COUNT = 3000;
+// 判断是否超额要整份读盘，先用 stat 的体积当廉价闸门：
+// 低于这个数时无论每条多小都还远没到需要轮转的开销。
+const ROTATE_CHECK_BYTES = 8 * 1024 * 1024;
+// 超额时一次多切一点，否则条数会长期贴着阈值，导致几乎每次生成都触发重写。
+const RUNS_ROTATE_SLACK = 200;
+// 未超额时只是一次 stat，一分钟一轮的开销可以忽略。
+const ROTATE_INTERVAL_MS = 60 * 1000;
 const WAITING_QUEUE_FILE = path.join(LOG_DIR, 'waiting-queue.json');
 const PLUGIN_RULE_CANDIDATES_FILE = path.join(LOG_DIR, 'plugin-rule-candidates.jsonl');
 const FORCE_STOP_DIAGNOSTICS_FILE = path.join(LOG_DIR, 'force-stop-diagnostics.jsonl');
@@ -128,10 +147,129 @@ async function readRunEntries() {
     }
 }
 
-async function rewriteRunEntries(entries) {
+// runs.jsonl 的整份重写有四个入口：改单条、回填插件规则、清空、轮转。
+// 它们都是"整份读进来、整份写回去"，两个重叠就会互相覆盖——后写的那份基于旧快照，
+// 中间那次改动直接消失，轮转和清空撞上时还会让存档和明细同时留着同一批记录。
+// 所以读也要进队列，只锁写没有用。
+let runsWriteChain = Promise.resolve();
+
+function serializeRunsWrite(task) {
+    // 前一个失败不能卡住后面的，成功失败两条路都接上。
+    const result = runsWriteChain.then(task, task);
+    runsWriteChain = result.catch(() => {});
+    return result;
+}
+
+// writeFile 会先把原文件截断再写，中途被杀就只剩半个文件。
+// 写临时文件再 rename，同一文件系统内 rename 是原子的：
+// 崩溃时要么是完整的旧内容，要么是完整的新内容，不会有截断态。
+async function writeRunsFileAtomic(content) {
     await fs.mkdir(LOG_DIR, { recursive: true });
+    await fs.writeFile(RUNS_TMP_FILE, content, 'utf8');
+    await fs.rename(RUNS_TMP_FILE, LOG_FILE);
+}
+
+async function rewriteRunEntries(entries) {
     const nextContent = entries.map((entry) => entry.line).join('\n');
-    await fs.writeFile(LOG_FILE, nextContent ? `${nextContent}\n` : '', 'utf8');
+    await writeRunsFileAtomic(nextContent ? `${nextContent}\n` : '');
+}
+
+// 轮转要先把超额记录追加到存档、再把明细截短。中间崩掉两头就对不上：
+// 存根已经进存档而明细还没截短，日聚合从此重复计数，而且不会有任何报错。
+// 标记文件里记下追加之前存档有多长，重启后按临时文件还在不在判断截短生效没有：
+// rename 会把临时文件消耗掉，它还在就说明没生效，把存档截回去等下一轮重做即可。
+async function recoverInterruptedRotation() {
+    let marker = null;
+    try {
+        marker = JSON.parse(await fs.readFile(ROTATE_MARKER_FILE, 'utf8'));
+    } catch {
+        // 没有标记说明上一次轮转完整走完了，只可能留下别处写了一半的临时文件。
+        await fs.rm(RUNS_TMP_FILE, { force: true });
+        return;
+    }
+
+    const tmpLeftBehind = await fs.stat(RUNS_TMP_FILE).then(() => true, () => false);
+    if (tmpLeftBehind && Number.isFinite(marker?.archive_size_before)) {
+        await fs.truncate(ARCHIVE_FILE, marker.archive_size_before).catch(() => {});
+        await fs.rm(RUNS_TMP_FILE, { force: true });
+    }
+
+    await fs.rm(ROTATE_MARKER_FILE, { force: true });
+}
+
+async function rotateRuns() {
+    await recoverInterruptedRotation();
+
+    let size;
+    try {
+        size = (await fs.stat(LOG_FILE)).size;
+    } catch {
+        return;
+    }
+
+    if (size < ROTATE_CHECK_BYTES) {
+        return;
+    }
+
+    // 按字节读：下面要靠长度差认出轮转期间新追加的内容，字符数在中文下对不上字节数。
+    const snapshot = await fs.readFile(LOG_FILE);
+    const lines = snapshot.toString('utf8').split(/\r?\n/).filter(Boolean);
+    if (lines.length <= RUNS_RETAINED_COUNT + RUNS_ROTATE_SLACK) {
+        return;
+    }
+
+    const dropped = lines.slice(0, lines.length - RUNS_RETAINED_COUNT);
+    const kept = lines.slice(lines.length - RUNS_RETAINED_COUNT);
+
+    const stubs = [];
+    for (const line of dropped) {
+        try {
+            const stub = toArchivedRunStub(JSON.parse(line));
+            if (stub) {
+                stubs.push(JSON.stringify(stub));
+            }
+        } catch {
+            // 解析不出来的行本来也进不了统计，跟着丢掉即可。
+        }
+    }
+
+    await fs.mkdir(LOG_DIR, { recursive: true });
+    // 下面的顺序是定死的，改动前请先读上面 recoverInterruptedRotation 的说明。
+    await fs.writeFile(RUNS_TMP_FILE, `${kept.join('\n')}\n`, 'utf8');
+
+    const archiveSizeBefore = await fs.stat(ARCHIVE_FILE).then((stat) => stat.size, () => 0);
+    await fs.writeFile(ROTATE_MARKER_FILE, JSON.stringify({ archive_size_before: archiveSizeBefore }), 'utf8');
+
+    if (stubs.length) {
+        await fs.appendFile(ARCHIVE_FILE, `${stubs.join('\n')}\n`, 'utf8');
+    }
+
+    // latency-monitor.js 落盘走的是另一个模块实例，排不进这条队列，只能自己接住：
+    // 它只会往尾巴上追加，所以超出快照长度的那一段就是轮转期间新写进来的，补回去。
+    //
+    // 这里只按偏移量读尾巴、不整份重读：整份重读一次要十几毫秒，
+    // 那段时间里又会有新的追加进来，补一轮多一轮，永远追不上。
+    // 只读增量是几十微秒，循环很快就收敛，剩下的窗口只有最后那次 rename。
+    let capturedLength = snapshot.length;
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+        const handle = await fs.open(LOG_FILE, 'r');
+        try {
+            const { size } = await handle.stat();
+            if (size <= capturedLength) {
+                break;
+            }
+
+            const tail = Buffer.alloc(size - capturedLength);
+            await handle.read(tail, 0, tail.length, capturedLength);
+            await fs.appendFile(RUNS_TMP_FILE, tail);
+            capturedLength = size;
+        } finally {
+            await handle.close();
+        }
+    }
+
+    await fs.rename(RUNS_TMP_FILE, LOG_FILE);
+    await fs.rm(ROTATE_MARKER_FILE, { force: true });
 }
 
 async function readRuns(limit = 50, offset = 0) {
@@ -163,6 +301,38 @@ async function readAllRuns() {
         .reverse();
 }
 
+// 存根保留的是一条一条的记录而不是算好的日行，所以按用途/聊天筛选、p95、
+// 摘要在存档期一样精确——直接和现存记录拼在一起交给 buildDailySummary 就行。
+async function readArchivedRunStubs() {
+    try {
+        const content = await fs.readFile(ARCHIVE_FILE, 'utf8');
+        return content
+            .split(/\r?\n/)
+            .filter(Boolean)
+            .map((line) => {
+                try {
+                    return JSON.parse(line);
+                } catch {
+                    return null;
+                }
+            })
+            .filter(Boolean);
+    } catch (error) {
+        if (error?.code === 'ENOENT') {
+            return [];
+        }
+
+        throw error;
+    }
+}
+
+// 日聚合的口径 = 已轮转出去的存根 + 现存明细。两边都是完整记录形状，
+// buildDailySummary 按日期分桶，不在意顺序，直接拼接即可。
+async function readRunsForDailySummary() {
+    const [archived, live] = await Promise.all([readArchivedRunStubs(), readAllRuns()]);
+    return archived.length ? archived.concat(live) : live;
+}
+
 async function readRunById(runId) {
     if (typeof runId !== 'string' || !runId.length) {
         return null;
@@ -177,31 +347,34 @@ async function updateRunById(runId, updater) {
         return null;
     }
 
-    const entries = await readRunEntries();
-    let updatedRun = null;
-    const nextEntries = entries.map((entry) => {
-        if (entry?.run?.id !== runId) {
-            return entry;
+    // 读和写要在同一次排队里：中间被轮转或清空插进来，这次修改会被旧快照覆盖掉。
+    return serializeRunsWrite(async () => {
+        const entries = await readRunEntries();
+        let updatedRun = null;
+        const nextEntries = entries.map((entry) => {
+            if (entry?.run?.id !== runId) {
+                return entry;
+            }
+
+            const nextRun = updater({ ...entry.run });
+            if (!nextRun || typeof nextRun !== 'object') {
+                return entry;
+            }
+
+            updatedRun = nextRun;
+            return {
+                line: JSON.stringify(nextRun),
+                run: nextRun,
+            };
+        });
+
+        if (!updatedRun) {
+            return null;
         }
 
-        const nextRun = updater({ ...entry.run });
-        if (!nextRun || typeof nextRun !== 'object') {
-            return entry;
-        }
-
-        updatedRun = nextRun;
-        return {
-            line: JSON.stringify(nextRun),
-            run: nextRun,
-        };
+        await rewriteRunEntries(nextEntries);
+        return updatedRun;
     });
-
-    if (!updatedRun) {
-        return null;
-    }
-
-    await rewriteRunEntries(nextEntries);
-    return updatedRun;
 }
 
 async function countRuns() {
@@ -237,31 +410,41 @@ function shouldDeleteRun(entry, scope, selectedRunIds) {
 }
 
 async function clearRuns(scope = 'all', selectedRunIds = []) {
-    const entries = await readRunEntries();
-    const existingRuns = entries.length;
     const normalizedRunIds = normalizeRunIds(selectedRunIds);
 
-    try {
-        await fs.mkdir(LOG_DIR, { recursive: true });
-        const keptEntries = entries.filter((entry) => !shouldDeleteRun(entry, scope, normalizedRunIds));
-        const nextContent = keptEntries.map((entry) => entry.line).join('\n');
-        await fs.writeFile(LOG_FILE, nextContent ? `${nextContent}\n` : '', 'utf8');
-        return {
-            deletedCount: existingRuns - keptEntries.length,
-            remainingCount: keptEntries.length,
-            selectedCount: normalizedRunIds.length,
-        };
-    } catch (error) {
-        if (error?.code === 'ENOENT') {
+    return serializeRunsWrite(async () => {
+        const entries = await readRunEntries();
+        const existingRuns = entries.length;
+
+        try {
+            const keptEntries = entries.filter((entry) => !shouldDeleteRun(entry, scope, normalizedRunIds));
+            const nextContent = keptEntries.map((entry) => entry.line).join('\n');
+            await writeRunsFileAtomic(nextContent ? `${nextContent}\n` : '');
+
+            // 清空全部时存档也要跟着清，否则明细空了、趋势图里还留着存档期的历史，
+            // 用户只会觉得没删干净。按勾选删和只删异常不动存档：
+            // 存根为了省体积没留 id，对应不到具体是哪几条。
+            if (scope === 'all' && !normalizedRunIds.length) {
+                await fs.rm(ARCHIVE_FILE, { force: true });
+            }
+
             return {
-                deletedCount: 0,
-                remainingCount: 0,
+                deletedCount: existingRuns - keptEntries.length,
+                remainingCount: keptEntries.length,
                 selectedCount: normalizedRunIds.length,
             };
-        }
+        } catch (error) {
+            if (error?.code === 'ENOENT') {
+                return {
+                    deletedCount: 0,
+                    remainingCount: 0,
+                    selectedCount: normalizedRunIds.length,
+                };
+            }
 
-        throw error;
-    }
+            throw error;
+        }
+    });
 }
 
 async function readWaitingQueueEntries() {
@@ -412,46 +595,49 @@ async function backfillRunsWithLearnedRule(rule, excludedRunId = '') {
         };
     }
 
-    const entries = await readRunEntries();
-    const updatedRuns = [];
-    const nextEntries = entries.map((entry) => {
-        const run = entry?.run;
-        if (!run || run.id === excludedRunId) {
-            return entry;
+    // 同样是整份读改写，必须和改单条、清空、轮转排同一条队。
+    return serializeRunsWrite(async () => {
+        const entries = await readRunEntries();
+        const updatedRuns = [];
+        const nextEntries = entries.map((entry) => {
+            const run = entry?.run;
+            if (!run || run.id === excludedRunId) {
+                return entry;
+            }
+
+            const match = matchLearnedPluginRuleAgainstRun(rule, run);
+            if (!match || match.ruleId !== rule.id || !shouldApplyLearnedRuleToRun(run, match)) {
+                return entry;
+            }
+
+            const updatedRun = {
+                ...run,
+                request_purpose: 'non_chat_generation',
+                request_plugin: match.pluginId || 'unknown_plugin',
+                request_plugin_label: match.pluginLabel,
+                request_plugin_match_mode: match.matchMode,
+                request_plugin_match_score: match.matchScore,
+            };
+            updatedRuns.push(updatedRun);
+            return {
+                line: JSON.stringify(updatedRun),
+                run: updatedRun,
+            };
+        });
+
+        if (!updatedRuns.length) {
+            return {
+                updatedCount: 0,
+                updatedRuns: [],
+            };
         }
 
-        const match = matchLearnedPluginRuleAgainstRun(rule, run);
-        if (!match || match.ruleId !== rule.id || !shouldApplyLearnedRuleToRun(run, match)) {
-            return entry;
-        }
-
-        const updatedRun = {
-            ...run,
-            request_purpose: 'non_chat_generation',
-            request_plugin: match.pluginId || 'unknown_plugin',
-            request_plugin_label: match.pluginLabel,
-            request_plugin_match_mode: match.matchMode,
-            request_plugin_match_score: match.matchScore,
-        };
-        updatedRuns.push(updatedRun);
+        await rewriteRunEntries(nextEntries);
         return {
-            line: JSON.stringify(updatedRun),
-            run: updatedRun,
+            updatedCount: updatedRuns.length,
+            updatedRuns,
         };
     });
-
-    if (!updatedRuns.length) {
-        return {
-            updatedCount: 0,
-            updatedRuns: [],
-        };
-    }
-
-    await rewriteRunEntries(nextEntries);
-    return {
-        updatedCount: updatedRuns.length,
-        updatedRuns,
-    };
 }
 
 async function buildPluginRuleSummaries() {
@@ -591,8 +777,19 @@ async function readPricingModelCatalog() {
 }
 
 
+let rotateTimer = null;
+
 export async function init(router) {
     router.use(express.json({ limit: '256kb' }));
+
+    // 轮转必须和上面几处整份重写排同一条队，所以放在插件这侧定时跑，
+    // 而不是 latency-monitor.js 落盘时顺手做——那边是另一个模块实例，共用不到这把锁。
+    rotateTimer = setInterval(() => {
+        serializeRunsWrite(rotateRuns).catch((error) => {
+            console.error('[st-latency-monitor] 轮转 runs.jsonl 失败：', error);
+        });
+    }, ROTATE_INTERVAL_MS);
+    rotateTimer.unref?.();
 
     router.get('/status', async (req, res) => {
         const storedRuns = await countRuns();
@@ -727,7 +924,7 @@ export async function init(router) {
         const days = Math.max(1, Math.min(365, Number(req.query.days) || 14));
         const runs = filterRunsByChatKey(
             filterRunsByPurpose(
-                groupBy === 'day' ? await readAllRuns() : await readRuns(limit),
+                groupBy === 'day' ? await readRunsForDailySummary() : await readRuns(limit),
                 requestedPurpose,
             ),
             requestedChatKey,
@@ -980,6 +1177,11 @@ export async function init(router) {
 }
 
 export async function exit() {
+    if (rotateTimer) {
+        clearInterval(rotateTimer);
+        rotateTimer = null;
+    }
+
     return Promise.resolve();
 }
 

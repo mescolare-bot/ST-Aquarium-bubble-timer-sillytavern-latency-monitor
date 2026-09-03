@@ -6,6 +6,12 @@
 
 import { generateAbnormalOptimizationSuggestions } from '../settings-ui/service/abnormal-optimization-suggestion-service.js';
 
+// message_sizes 是每条消息一个对象，整份落盘时一条 500 楼的记录就要约 88KB，
+// 实测占了 runs.jsonl 一半以上的体积。消费方只取按字数排序的前 5 条，
+// 这里留 20 条是给它四倍余量，另外再留最后 20 条以便回看近期消息。
+const PROMPT_BREAKDOWN_TOP_MESSAGE_COUNT = 20;
+const PROMPT_BREAKDOWN_RECENT_MESSAGE_COUNT = 20;
+
 export function safeStringifyLength(value) {
     try {
         return JSON.stringify(value).length;
@@ -120,12 +126,25 @@ export function summarizeMessages(messages) {
     // 这里刻意不再落盘 top_messages / recent_messages。
     // 它们只是 message_sizes 的排序切片，重复存储会让每条记录多出约 1.7KB，
     // 而消费方从 message_sizes 现算即可，信息没有任何损失。
+    //
+    // message_sizes 本身也只落一个采样：最占字数的若干条，加上最后若干条。
+    // total_chars 和 role_totals 都在采样之前按全量算好，统计口径不受影响；
+    // 需要知道完整条数时看 total_messages。
+    const keptIndexes = new Set();
+    [...messageSizes]
+        .sort((left, right) => right.chars - left.chars)
+        .slice(0, PROMPT_BREAKDOWN_TOP_MESSAGE_COUNT)
+        .forEach((item) => keptIndexes.add(item.index));
+    messageSizes
+        .slice(-PROMPT_BREAKDOWN_RECENT_MESSAGE_COUNT)
+        .forEach((item) => keptIndexes.add(item.index));
+
     return {
         mode: 'messages',
         total_messages: messages.length,
         total_chars: messageSizes.reduce((sum, item) => sum + item.chars, 0),
         role_totals: roleTotals,
-        message_sizes: messageSizes,
+        message_sizes: messageSizes.filter((item) => keptIndexes.has(item.index)),
     };
 }
 

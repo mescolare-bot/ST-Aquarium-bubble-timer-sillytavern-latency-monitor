@@ -6,10 +6,20 @@ import { normalizeModelName } from './run-analysis.js';
 
 export { normalizeModelName };
 
-export function normalizeOptionalText(value) {
-    return typeof value === 'string' && value.trim()
-        ? value.trim()
-        : '';
+// 这里曾经悄悄吞掉第二个参数，导致 `normalizeOptionalText(value, 200)` 这类
+// 写明了上限的调用其实完全没有上限。plugin-rule-service.js 里另有一份带截断的
+// 同名实现，两份行为不一致正是那个 bug 的来源，现在以这份为准，那边直接引用。
+export function normalizeOptionalText(value, maxLength = 120) {
+    if (typeof value !== 'string') {
+        return '';
+    }
+
+    const trimmed = value.trim();
+    if (!trimmed) {
+        return '';
+    }
+
+    return trimmed.slice(0, maxLength);
 }
 export function normalizeRequestPurpose(value) {
     return value === 'non_chat_generation' || value === 'plugin_internal_request'
@@ -155,6 +165,61 @@ export function getRunUsage(run) {
 
 export function isAbnormalRun(run) {
     return Boolean(run?.abnormal_detail?.abnormal_type);
+}
+
+// 明细轮转出去之后，日聚合仍然要能算。这里把一条完整记录投影成"统计够用的最小存根"：
+// 实测平均 288 字节，只有完整记录的 4.5%，两个月的历史压完不到 2 MB。
+//
+// 字段清单不是随便挑的，是 getRunDate、filterRunsByPurpose、filterRunsByChatKey、
+// buildSummary、buildDailySummary、isAbnormalRun 这六处实际访问到的全部字段。
+// 往那几个函数里加新的读取时，必须同步加到这里，否则存档期的统计会静默缺项。
+//
+// 存的是记录而不是算好的日行，所以按聊天/用途筛选、p95、摘要全都保持精确，
+// 合并时把存根数组和现存记录接起来交给 buildDailySummary 即可，不需要另一套聚合。
+export function toArchivedRunStub(run) {
+    if (!run || typeof run !== 'object') {
+        return null;
+    }
+
+    const stub = {
+        started_at_ms: run.started_at_ms,
+        started_at_iso: run.started_at_ms ? undefined : run.started_at_iso,
+        request_purpose: run.request_purpose,
+        request_chat_key: run.request_chat_key,
+        model: run.model,
+        archived: true,
+    };
+
+    const metrics = run.metrics;
+    if (metrics && typeof metrics === 'object') {
+        stub.metrics = {
+            total_ms: metrics.total_ms,
+            preprocess_ms: metrics.preprocess_ms,
+            upstream_headers_ms: metrics.upstream_headers_ms,
+            ttft_ms: metrics.ttft_ms,
+            stream_ms: metrics.stream_ms,
+        };
+    }
+
+    const usage = run.response_usage;
+    if (usage && typeof usage === 'object') {
+        stub.response_usage = {
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+            cached_tokens: usage.cached_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
+            cache_hit: usage.cache_hit,
+        };
+    }
+
+    const abnormalType = run.abnormal_detail?.abnormal_type;
+    if (abnormalType) {
+        stub.abnormal_detail = { abnormal_type: abnormalType };
+    }
+
+    return stub;
 }
 
 export function countByValue(items) {

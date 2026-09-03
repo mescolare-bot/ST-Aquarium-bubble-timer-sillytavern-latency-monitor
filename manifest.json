@@ -7,7 +7,7 @@
   "js": "index.js",
   "css": "style.css",
   "loading_order": 999,
-  "minimum_client_version": "1.12.6",
+  "minimum_client_version": "1.18.0",
   "auto_update": false,
   "homePage": "https://github.com/mescolare-bot/ST-Aquarium-bubble-timer-sillytavern-latency-monitor"
 }
