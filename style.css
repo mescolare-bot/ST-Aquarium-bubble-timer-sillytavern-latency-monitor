@@ -2259,6 +2259,35 @@ body.stlp-page-host-open {
     word-break: break-word;
 }
 
+.stlp-pricing-local-only {
+    color: var(--stlp-highlight-warn-text);
+    font-weight: 600;
+}
+
+.stlp-pricing-sync-notice {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 10px;
+    padding: 10px 12px;
+    border: 1px solid var(--stlp-highlight-warn-border);
+    border-radius: 8px;
+    background: var(--stlp-highlight-warn-bg);
+    color: var(--stlp-highlight-warn-text);
+    font-size: var(--stlp-font-body);
+    line-height: 1.6;
+}
+
+.stlp-pricing-sync-notice > div {
+    flex: 1 1 240px;
+    min-width: 0;
+}
+
+.stlp-pricing-sync-button {
+    flex: 0 0 auto;
+}
+
 .stlp-pricing-field {
     min-width: 0;
 }
@@ -2307,6 +2336,9 @@ body.stlp-page-host-open {
     display: flex;
     align-items: center;
     justify-content: space-between;
+    /* 这一行嵌在四层内边距里，窄面板下放不下三个元素。不允许换行的话，
+       右边的状态徽标和箭头不参与收缩，压缩会全部落到文字列上，把说明文字挤成一字一行。 */
+    flex-wrap: wrap;
     gap: 10px;
     padding: 12px 14px;
     border: 0;
@@ -2321,7 +2353,8 @@ body.stlp-page-host-open {
     flex-direction: column;
     gap: 4px;
     min-width: 0;
-    flex: 1 1 auto;
+    /* 基准宽度即换行阈值：放不下就让徽标和箭头掉到第二行，宽面板下照旧一行排开。 */
+    flex: 1 1 160px;
 }
 
 .stlp-pricing-peak-valley-status {
