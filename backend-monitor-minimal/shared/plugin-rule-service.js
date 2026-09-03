@@ -3,6 +3,8 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 
+import { normalizeOptionalText } from './run-query.js';
+
 const LOG_DIR = path.join(process.cwd(), 'data', 'default-user', 'latency-monitor');
 const PLUGIN_RULES_FILE = path.join(LOG_DIR, 'plugin-rules.json');
 
@@ -21,18 +23,9 @@ const MATCH_MODE = 'learned_rule';
 let cachedRulesMtimeMs = -1;
 let cachedRules = [];
 
-export function normalizeOptionalText(value, maxLength = 120) {
-    if (typeof value !== 'string') {
-        return '';
-    }
-
-    const trimmed = value.trim();
-    if (!trimmed) {
-        return '';
-    }
-
-    return trimmed.slice(0, maxLength);
-}
+// 实现统一放在 run-query.js（那份不含任何 Node 依赖，纯前端形态也要用）。
+// 这里保留同名导出，是因为已经有调用方从本模块取它。
+export { normalizeOptionalText };
 
 export function slugifyPluginId(value) {
     const normalized = normalizeOptionalText(value)

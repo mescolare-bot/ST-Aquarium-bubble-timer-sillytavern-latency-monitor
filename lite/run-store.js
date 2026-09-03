@@ -6,10 +6,15 @@
 // 这一层只管存取，不做任何筛选和统计——那些走 shared/run-query.js，
 // 和后端用的是同一份实现。
 
+import { toArchivedRunStub } from '../backend-monitor-minimal/shared/run-query.js';
+
 const DB_NAME = 'st-latency-monitor';
-const DB_VERSION = 1;
+// v2 加了 archive 存储。升级只建表不搬数据，旧记录原样留在 runs 里，
+// 等下一次 pruneRuns 自然把超额的那批压成存根挪过去。
+const DB_VERSION = 2;
 const RUNS_STORE = 'runs';
 const META_STORE = 'meta';
+const ARCHIVE_STORE = 'archive';
 
 // 浏览器这边没人帮忙轮转日志，不设上限迟早把用户的磁盘配额吃满，
 // 配额满了之后 IndexedDB 会直接开始写失败。按时间倒序保留最近这么多条。
@@ -39,6 +44,11 @@ function openDatabase() {
             }
             if (!db.objectStoreNames.contains(META_STORE)) {
                 db.createObjectStore(META_STORE);
+            }
+            if (!db.objectStoreNames.contains(ARCHIVE_STORE)) {
+                // 超额被清掉的记录压成存根留在这里，只供日聚合用。
+                // 存根没有 id（那是排障字段），所以用自增主键。
+                db.createObjectStore(ARCHIVE_STORE, { autoIncrement: true });
             }
         };
 
@@ -148,6 +158,13 @@ export async function clearRuns(scope = 'all', runIds = []) {
         }
     });
 
+    // 清空全部时存档也要跟着清，否则明细空了、趋势图里还留着存档期的历史，
+    // 用户只会觉得没删干净。按勾选删和只删异常不动存档：
+    // 存根为了省体积没留 id，对应不到具体是哪几条。和后端 clearRuns 的口径一致。
+    if (scope === 'all' && !idFilter) {
+        await runTransaction(ARCHIVE_STORE, 'readwrite', (store) => box(store.clear()));
+    }
+
     return {
         deletedCount: toDelete.length,
         remainingCount: all.length - toDelete.length,
@@ -155,6 +172,9 @@ export async function clearRuns(scope = 'all', runIds = []) {
     };
 }
 
+// 超额的记录不是直接扔掉，而是先压成存根挪进 archive，日聚合仍然算得出来。
+// 存根平均 288 字节，只有完整记录的 4.5%，这点体积换"历史统计不断层"很划算。
+// 和后端 latency-monitor.js 的轮转是同一套语义，两种形态的日聚合口径保持一致。
 async function pruneRuns(maxRuns = DEFAULT_MAX_RUNS) {
     const total = await countRuns();
     if (total <= maxRuns) {
@@ -163,12 +183,30 @@ async function pruneRuns(maxRuns = DEFAULT_MAX_RUNS) {
 
     const all = await readAllRuns();
     const stale = all.slice(maxRuns);
+
+    // 顺序不能反：先把存根写稳，再删明细。
+    // 反过来一旦中途失败，明细已经没了而存档还没写，历史统计就真丢了。
+    const stubs = stale.map((run) => toArchivedRunStub(run)).filter(Boolean);
+    if (stubs.length) {
+        await runTransaction(ARCHIVE_STORE, 'readwrite', (store) => {
+            for (const stub of stubs) {
+                store.add(stub);
+            }
+        });
+    }
+
     await runTransaction(RUNS_STORE, 'readwrite', (store) => {
         for (const run of stale) {
             store.delete(run.id);
         }
     });
     return stale.length;
+}
+
+/** 已归档的存根。只含统计字段，排障要的东西都不在里面。 */
+export async function readArchivedRunStubs() {
+    const result = await runTransaction(ARCHIVE_STORE, 'readonly', (store) => box(store.getAll()));
+    return Array.isArray(result) ? result : [];
 }
 
 export async function readMeta(key, fallback = null) {

@@ -26,9 +26,11 @@ import {
     shouldReplaceCapturedUsage,
     summarizePrompt,
 } from './shared/run-analysis.js';
-
 const LOG_DIR = path.join(process.cwd(), 'data', 'default-user', 'latency-monitor');
 const LOG_FILE = path.join(LOG_DIR, 'runs.jsonl');
+// 这里只往尾巴上追加，绝不整份重写。runs.jsonl 的轮转、清空、改单条都在服务插件那侧，
+// 由它自己的串行锁排队——本文件和服务插件是两个互不相通的模块实例，共用不到那把锁，
+// 在这里再开一个整份写者就会和它们互相覆盖。
 // 服务插件和本文件是两个互不相通的模块实例，只能靠 LOG_DIR 下的文件传话。
 // 这里只读不写，写入与过期清理都由服务插件那侧负责，避免两个写者互相覆盖。
 const CLIENT_STOP_SIGNALS_FILE = path.join(LOG_DIR, 'client-stop-signals.json');
