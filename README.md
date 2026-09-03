@@ -36,7 +36,8 @@
 2. 粘贴 `https://github.com/mescolare-bot/ST-Aquarium-bubble-timer-sillytavern-latency-monitor.git`，确认
 3. 按 `Ctrl + Shift + R` 强制刷新
 
-装完右下角会多一个悬浮图标，点开就是面板。图标显示为琥珀色表示当前跑在精简版。
+装完右下角会多一个悬浮图标，点开就是面板。悬浮图标的颜色由你自己在设置里选，两种装法都一样；
+想确认当前跑在哪一种，看面板标题右边那个小圆点：橙色是精简版，绿色是完整版，红色是连不上后端。
 
 精简版的三个限制先说在前面：
 
