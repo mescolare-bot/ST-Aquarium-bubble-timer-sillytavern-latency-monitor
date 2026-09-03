@@ -197,8 +197,13 @@ async function handleStatus() {
         effective_runtime_mode: permissionLevel,
         detected_permission_level: permissionLevel,
         permission_level: permissionLevel,
-        current_floor_only: Boolean(settings?.runtime?.current_floor_only),
-        history_scan_forbidden: false,
+        // 这两条是对行为的声明，和完整版报一样的值：读楼层的代码在 index.js 里，两种装法共用同一份。
+        // readCurrentGenerationFloor 只取 chat.length 和最后一个元素，是 O(1)；
+        // readVisibleFloorLabels 只读已渲染消息上的 #N 标签，不碰消息内容。lite/ 自己完全接触不到 chat。
+        // 早先这里写的是 false，而 current_floor_only 读的还是一个设置里根本不存在的键（恒为 false），
+        // 于是精简版面板上这两行一直显示「否」，看起来像是保证被撤了，其实行为从来没变过。
+        current_floor_only: true,
+        history_scan_forbidden: true,
     };
 }
 
