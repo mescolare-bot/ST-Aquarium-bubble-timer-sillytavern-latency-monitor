@@ -2366,6 +2366,12 @@ function getPricingCurrencyLabel(value = "usd") {
 }
 
 function normalizeConfiguredPriceValue(value) {
+    // 未填写和填了 0 是两回事。Number(null) 和 Number("") 都等于 0，不挡住就会把"没填"
+    // 变成"填了 0"，后端 normalizeOptionalPricingNumber 一直是这么挡的，这里对齐。
+    if (value === null || value === undefined || value === "") {
+        return null;
+    }
+
     const numberValue = Number(value);
     return Number.isFinite(numberValue) && numberValue >= 0 ? Math.round(numberValue * 1000000) / 1000000 : null;
 }
@@ -2492,18 +2498,41 @@ function getRunPeakValleySelection(run, config) {
     };
 }
 
-function getModelPricingMap() {
-    const localPricingMap = state.uiSettings?.pricingConfigByModel && typeof state.uiSettings.pricingConfigByModel === "object"
+function getLocalPricingMap() {
+    return state.uiSettings?.pricingConfigByModel && typeof state.uiSettings.pricingConfigByModel === "object"
         ? state.uiSettings.pricingConfigByModel
         : {};
-    const backendPricingMap = state.settings?.pricing?.model_prices && typeof state.settings.pricing.model_prices === "object"
+}
+
+function getBackendPricingMap() {
+    return state.settings?.pricing?.model_prices && typeof state.settings.pricing.model_prices === "object"
         ? state.settings.pricing.model_prices
         : {};
+}
 
+function getModelPricingMap() {
     return {
-        ...localPricingMap,
-        ...backendPricingMap,
+        ...getLocalPricingMap(),
+        ...getBackendPricingMap(),
     };
+}
+
+// 后端那份才是权威：换设备、清浏览器数据之后只剩它，异常记录的费用估算也只读它。
+// 本地填了价格而后端没有，说明当时那次保存没送达；面板把两份合起来显示，
+// 不特意标出来就完全看不出区别。
+function getLocalOnlyPricedModels() {
+    // state.settings 还没拉回来时后端那份是空的，此时判断会把所有模型都误报成未同步。
+    if (!isPlainRecord(state.settings)) {
+        return [];
+    }
+
+    const localPricingMap = getLocalPricingMap();
+    const backendPricingMap = getBackendPricingMap();
+
+    return Object.keys(localPricingMap).filter((modelName) => (
+        hasConfiguredPriceValues(localPricingMap[modelName])
+        && !hasConfiguredPriceValues(backendPricingMap[modelName])
+    ));
 }
 
 function getModelPriceConfig(modelName) {
@@ -2518,6 +2547,45 @@ function getModelPriceConfig(modelName) {
 
 function getModelPriceCurrency(modelName) {
     return normalizePricingCurrency(getModelPriceConfig(modelName)?.currency);
+}
+
+// 估算用的查找：精确匹配不上就从左往右逐段剥掉中转层前缀。
+// 和 getModelPriceConfig 分开是故意的——设置里的编辑框只能显示这个模型自己配的值，
+// 若也走回退，一改动就把沿用来的价格固化成它自己的配置，回退当场失效。
+function resolveModelPricingEntry(modelName) {
+    const normalizedModelName = typeof modelName === "string" ? modelName.trim() : "";
+    if (!normalizedModelName) {
+        return null;
+    }
+
+    const pricingMap = getModelPricingMap();
+    const candidates = [normalizedModelName];
+    let rest = normalizedModelName;
+    let separatorIndex = rest.indexOf("/");
+    while (separatorIndex >= 0) {
+        rest = rest.slice(separatorIndex + 1);
+        if (rest) {
+            candidates.push(rest);
+        }
+        separatorIndex = rest.indexOf("/");
+    }
+
+    for (const candidate of candidates) {
+        if (pricingMap[candidate] === undefined) {
+            continue;
+        }
+
+        const normalizedConfig = normalizePricingConfig(pricingMap[candidate]);
+        if (hasConfiguredPriceValues(normalizedConfig)) {
+            return {
+                modelName: candidate,
+                config: normalizedConfig,
+                isFallback: candidate !== normalizedModelName,
+            };
+        }
+    }
+
+    return null;
 }
 
 function getPricingPanelOpenStates() {
@@ -2679,12 +2747,13 @@ function collectPricingModels() {
 
 function getRunEstimatedPrice(run) {
     const usage = getRunUsage(run);
-    const config = getModelPriceConfig(run?.model);
-    if (!config) {
+    const pricingEntry = resolveModelPricingEntry(run?.model);
+    if (!pricingEntry) {
         return null;
     }
 
-    const currency = getModelPriceCurrency(run?.model);
+    const config = pricingEntry.config;
+    const currency = normalizePricingCurrency(config.currency);
     const baseInputPrice = normalizeConfiguredPriceValue(config.input_price_per_million);
     const baseCachedInputPrice = normalizeConfiguredPriceValue(config.cached_input_price_per_million);
     const baseOutputPrice = normalizeConfiguredPriceValue(config.output_price_per_million);
@@ -2756,9 +2825,13 @@ function getRunEstimatedPrice(run) {
         }
     }
 
-    const pricingNote = noteParts.length >= 2
+    const basePricingNote = noteParts.length >= 2
         ? `已按${noteParts.join("、")}估算`
         : (noteParts[0] ? `当前仅按${noteParts[0]}估算` : "当前按已配置价格估算");
+    // 沿用别的名字算钱时必须说出来，否则套错档位（例如付费档用了普通档单价）根本看不出来。
+    const pricingNote = pricingEntry.isFallback
+        ? `${basePricingNote}。这个模型没有单独配价，沿用了 ${pricingEntry.modelName} 的价格`
+        : basePricingNote;
 
     return {
         currency,
@@ -6170,6 +6243,27 @@ function persistPricingModelConfig(modelName, config) {
     }, { deferBusyRender: true, optimistic: true });
 }
 
+// 逐个补发会打出 N 个请求，中途失败还会留下改了一半的状态。
+// 后端的 deepMerge 支持一次收多个模型，所以合成一条发。
+async function syncLocalOnlyPricingToBackend() {
+    if (state.isSaving) {
+        return;
+    }
+
+    const modelNames = getLocalOnlyPricedModels();
+    if (!modelNames.length) {
+        return;
+    }
+
+    const localPricingMap = getLocalPricingMap();
+    const modelPrices = {};
+    for (const modelName of modelNames) {
+        modelPrices[modelName] = normalizePricingConfig(localPricingMap[modelName]);
+    }
+
+    await updateMonitorSettings({ pricing: { model_prices: modelPrices } });
+}
+
 async function updateMonitorSettings(partialSettings, { deferBusyRender = false, optimistic = false } = {}) {
     if (state.extensionDisabled) {
         return;
@@ -6576,6 +6670,7 @@ function buildSettingsContentHtml() {
     const permissionLevel = state.status?.permission_level || state.status?.effective_runtime_mode || "no_backend";
     const disableEnhancedToggle = permissionLevel === "no_backend";
     const pricingModels = collectPricingModels();
+    const localOnlyPricedModels = new Set(getLocalOnlyPricedModels());
     const outputCardFields = getOutputCardFields();
     const settingsCategory = normalizeSettingsCategory(state.uiSettings.settingsCategory);
     const minimizedButtonColorMode = normalizeMinimizedButtonColorMode(state.uiSettings.minimizedButtonColorMode);
@@ -6648,6 +6743,12 @@ function buildSettingsContentHtml() {
     const pricingContent = `
             <div class="stlp-settings-subtitle">模型价格估算</div>
             <div class="stlp-note">这里会列出后台已经抓到的模型。每个模型都可以单独选择美元或人民币，填写输入 / 缓存输入 / 输出每 100 万 Token 的价格；详情里的估算金额会跟着这个模型自己的单位显示。峰谷计费按本机时间判断，只需要配置峰时段，其余时间会自动按谷时段计算。</div>
+            ${localOnlyPricedModels.size ? `
+                <div class="stlp-pricing-sync-notice">
+                    <div>有 ${localOnlyPricedModels.size} 个模型的价格只存在这台浏览器里，没有存到服务器。换设备打开会看不到，清掉浏览器数据就会丢失，异常记录的费用也算不出来。</div>
+                    <button class="menu_button stlp-pricing-sync-button" type="button" data-action="sync-local-pricing" ${state.isSaving ? "disabled" : ""}>全部同步到服务器</button>
+                </div>
+            ` : ""}
             ${!pricingModels.length ? `
                 <div class="stlp-note">当前还没抓到任何模型。等后台先记录几次生成后，这里会自动列出模型。</div>
             ` : `
@@ -6693,16 +6794,27 @@ function buildSettingsContentHtml() {
                         const peakValleySummary = peakValleyEnabled
                             ? `峰时 ${peakStartTime && peakEndTime ? `${peakStartTime} - ${peakEndTime}` : "待补时段"}`
                             : "峰谷未启用";
+                        // 自己没配价但能靠剥前缀沿用到别人的，要写出来沿用的是谁，
+                        // 免得看着像"待填"而其实一直在按别的单价算钱。
+                        const inheritedPricingEntry = hasConfiguredPriceValues(config)
+                            ? null
+                            : resolveModelPricingEntry(modelName);
+                        const inheritedCurrencyLabel = inheritedPricingEntry
+                            ? getPricingCurrencyLabel(normalizePricingCurrency(inheritedPricingEntry.config.currency))
+                            : "";
                         const compactSummary = configuredSummary
                             ? `${currencyLabel} · ${configuredSummary}`
-                            : `${currencyLabel} · 价格待填`;
+                            : (inheritedPricingEntry
+                                ? `${inheritedCurrencyLabel} · 沿用 ${inheritedPricingEntry.modelName}`
+                                : `${currencyLabel} · 价格待填`);
+                        const pricingLocalOnly = localOnlyPricedModels.has(modelName);
 
                         return `
                             <div class="stlp-pricing-model-card ${panelOpen ? "is-open" : ""}">
                                 <button class="stlp-pricing-model-summary" type="button" data-action="toggle-pricing-panel" data-pricing-model="${escapeHtml(modelName)}" aria-expanded="${panelOpen ? "true" : "false"}">
                                     <span class="stlp-pricing-model-summary-main">
                                         <span class="stlp-pricing-model-name">${escapeHtml(modelName)}</span>
-                                        <span class="stlp-pricing-model-note">${escapeHtml(compactSummary)}</span>
+                                        <span class="stlp-pricing-model-note">${escapeHtml(compactSummary)}${pricingLocalOnly ? ` · <span class="stlp-pricing-local-only">仅存本机</span>` : ""}</span>
                                     </span>
                                     <span class="stlp-pricing-model-chevron" aria-hidden="true">▾</span>
                                 </button>
@@ -6719,15 +6831,15 @@ function buildSettingsContentHtml() {
                                         </div>
                                         <label class="stlp-number stlp-pricing-field stlp-pricing-field-vertical">
                                             <span>输入单价（${escapeHtml(currencyLabel)}）</span>
-                                            <input type="number" min="0" step="0.000001" inputmode="decimal" placeholder="${currencyLabel}，可选" value="${inputPriceValue}" data-pricing-model="${escapeHtml(modelName)}" data-pricing-field="input_price_per_million" ${(state.isSaving || !allowPricingEdit) ? "disabled" : ""} />
+                                            <input type="number" min="0" step="0.1" inputmode="decimal" placeholder="${currencyLabel}，可选" value="${inputPriceValue}" data-pricing-model="${escapeHtml(modelName)}" data-pricing-field="input_price_per_million" ${(state.isSaving || !allowPricingEdit) ? "disabled" : ""} />
                                         </label>
                                         <label class="stlp-number stlp-pricing-field stlp-pricing-field-vertical">
                                             <span>缓存输入单价（${escapeHtml(currencyLabel)}）</span>
-                                            <input type="number" min="0" step="0.000001" inputmode="decimal" placeholder="${currencyLabel}，可选" value="${cachedInputPriceValue}" data-pricing-model="${escapeHtml(modelName)}" data-pricing-field="cached_input_price_per_million" ${(state.isSaving || !allowPricingEdit) ? "disabled" : ""} />
+                                            <input type="number" min="0" step="0.1" inputmode="decimal" placeholder="${currencyLabel}，可选" value="${cachedInputPriceValue}" data-pricing-model="${escapeHtml(modelName)}" data-pricing-field="cached_input_price_per_million" ${(state.isSaving || !allowPricingEdit) ? "disabled" : ""} />
                                         </label>
                                         <label class="stlp-number stlp-pricing-field stlp-pricing-field-vertical">
                                             <span>输出单价（${escapeHtml(currencyLabel)}）</span>
-                                            <input type="number" min="0" step="0.000001" inputmode="decimal" placeholder="${currencyLabel}，可选" value="${outputPriceValue}" data-pricing-model="${escapeHtml(modelName)}" data-pricing-field="output_price_per_million" ${(state.isSaving || !allowPricingEdit) ? "disabled" : ""} />
+                                            <input type="number" min="0" step="0.1" inputmode="decimal" placeholder="${currencyLabel}，可选" value="${outputPriceValue}" data-pricing-model="${escapeHtml(modelName)}" data-pricing-field="output_price_per_million" ${(state.isSaving || !allowPricingEdit) ? "disabled" : ""} />
                                         </label>
                                     </div>
                                     <div class="stlp-pricing-actions">
@@ -6763,30 +6875,30 @@ function buildSettingsContentHtml() {
                                                     <div class="stlp-pricing-inline-label">峰时价格</div>
                                                     <label class="stlp-number stlp-pricing-field stlp-pricing-field-vertical">
                                                         <span>输入单价（${escapeHtml(currencyLabel)}）</span>
-                                                        <input type="number" min="0" step="0.000001" inputmode="decimal" placeholder="${currencyLabel}，可选" value="${peakInputPriceValue}" data-pricing-model="${escapeHtml(modelName)}" data-pricing-field="peak_input_price_per_million" ${(state.isSaving || !allowPricingEdit) ? "disabled" : ""} />
+                                                        <input type="number" min="0" step="0.1" inputmode="decimal" placeholder="${currencyLabel}，可选" value="${peakInputPriceValue}" data-pricing-model="${escapeHtml(modelName)}" data-pricing-field="peak_input_price_per_million" ${(state.isSaving || !allowPricingEdit) ? "disabled" : ""} />
                                                     </label>
                                                     <label class="stlp-number stlp-pricing-field stlp-pricing-field-vertical">
                                                         <span>缓存输入单价（${escapeHtml(currencyLabel)}）</span>
-                                                        <input type="number" min="0" step="0.000001" inputmode="decimal" placeholder="${currencyLabel}，可选" value="${peakCachedInputPriceValue}" data-pricing-model="${escapeHtml(modelName)}" data-pricing-field="peak_cached_input_price_per_million" ${(state.isSaving || !allowPricingEdit) ? "disabled" : ""} />
+                                                        <input type="number" min="0" step="0.1" inputmode="decimal" placeholder="${currencyLabel}，可选" value="${peakCachedInputPriceValue}" data-pricing-model="${escapeHtml(modelName)}" data-pricing-field="peak_cached_input_price_per_million" ${(state.isSaving || !allowPricingEdit) ? "disabled" : ""} />
                                                     </label>
                                                     <label class="stlp-number stlp-pricing-field stlp-pricing-field-vertical">
                                                         <span>输出单价（${escapeHtml(currencyLabel)}）</span>
-                                                        <input type="number" min="0" step="0.000001" inputmode="decimal" placeholder="${currencyLabel}，可选" value="${peakOutputPriceValue}" data-pricing-model="${escapeHtml(modelName)}" data-pricing-field="peak_output_price_per_million" ${(state.isSaving || !allowPricingEdit) ? "disabled" : ""} />
+                                                        <input type="number" min="0" step="0.1" inputmode="decimal" placeholder="${currencyLabel}，可选" value="${peakOutputPriceValue}" data-pricing-model="${escapeHtml(modelName)}" data-pricing-field="peak_output_price_per_million" ${(state.isSaving || !allowPricingEdit) ? "disabled" : ""} />
                                                     </label>
                                                 </div>
                                                 <div class="stlp-pricing-band-column">
                                                     <div class="stlp-pricing-inline-label">谷时价格</div>
                                                     <label class="stlp-number stlp-pricing-field stlp-pricing-field-vertical">
                                                         <span>输入单价（${escapeHtml(currencyLabel)}）</span>
-                                                        <input type="number" min="0" step="0.000001" inputmode="decimal" placeholder="${currencyLabel}，可选" value="${valleyInputPriceValue}" data-pricing-model="${escapeHtml(modelName)}" data-pricing-field="valley_input_price_per_million" ${(state.isSaving || !allowPricingEdit) ? "disabled" : ""} />
+                                                        <input type="number" min="0" step="0.1" inputmode="decimal" placeholder="${currencyLabel}，可选" value="${valleyInputPriceValue}" data-pricing-model="${escapeHtml(modelName)}" data-pricing-field="valley_input_price_per_million" ${(state.isSaving || !allowPricingEdit) ? "disabled" : ""} />
                                                     </label>
                                                     <label class="stlp-number stlp-pricing-field stlp-pricing-field-vertical">
                                                         <span>缓存输入单价（${escapeHtml(currencyLabel)}）</span>
-                                                        <input type="number" min="0" step="0.000001" inputmode="decimal" placeholder="${currencyLabel}，可选" value="${valleyCachedInputPriceValue}" data-pricing-model="${escapeHtml(modelName)}" data-pricing-field="valley_cached_input_price_per_million" ${(state.isSaving || !allowPricingEdit) ? "disabled" : ""} />
+                                                        <input type="number" min="0" step="0.1" inputmode="decimal" placeholder="${currencyLabel}，可选" value="${valleyCachedInputPriceValue}" data-pricing-model="${escapeHtml(modelName)}" data-pricing-field="valley_cached_input_price_per_million" ${(state.isSaving || !allowPricingEdit) ? "disabled" : ""} />
                                                     </label>
                                                     <label class="stlp-number stlp-pricing-field stlp-pricing-field-vertical">
                                                         <span>输出单价（${escapeHtml(currencyLabel)}）</span>
-                                                        <input type="number" min="0" step="0.000001" inputmode="decimal" placeholder="${currencyLabel}，可选" value="${valleyOutputPriceValue}" data-pricing-model="${escapeHtml(modelName)}" data-pricing-field="valley_output_price_per_million" ${(state.isSaving || !allowPricingEdit) ? "disabled" : ""} />
+                                                        <input type="number" min="0" step="0.1" inputmode="decimal" placeholder="${currencyLabel}，可选" value="${valleyOutputPriceValue}" data-pricing-model="${escapeHtml(modelName)}" data-pricing-field="valley_output_price_per_million" ${(state.isSaving || !allowPricingEdit) ? "disabled" : ""} />
                                                     </label>
                                                 </div>
                                             </div>
@@ -8325,6 +8437,11 @@ function handlePanelAction(actionTarget, event) {
             ...currentConfig,
             currency: nextCurrency,
         });
+        return true;
+    }
+
+    if (action === "sync-local-pricing") {
+        void syncLocalOnlyPricingToBackend();
         return true;
     }
 

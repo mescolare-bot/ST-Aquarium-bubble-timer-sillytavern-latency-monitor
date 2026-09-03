@@ -245,6 +245,41 @@ export function normalizeModelName(value) {
         : '';
 }
 
+// 中转层会在模型名前面加路由前缀（例如 假流式/gemini-3.1-pro-preview），底下往往是同一个模型。
+// 精确匹配不上时就从左往右逐段剥掉前缀再找。显式配置的名字永远先命中，所以要给某个前缀
+// 单独定价，照原样配一条就能盖住回退——硅基流动的 Pro/ 付费档就得这么配，否则会套用非
+// Pro 的便宜价。回退时把命中的名字一起返回，好让界面写明钱是按谁算的。
+export function resolvePricingModelEntry(modelName, modelPrices) {
+    const normalizedModelName = normalizeModelName(modelName);
+    if (!normalizedModelName || !modelPrices || typeof modelPrices !== 'object') {
+        return null;
+    }
+
+    const candidates = [normalizedModelName];
+    let rest = normalizedModelName;
+    let separatorIndex = rest.indexOf('/');
+    while (separatorIndex >= 0) {
+        rest = rest.slice(separatorIndex + 1);
+        if (rest) {
+            candidates.push(rest);
+        }
+        separatorIndex = rest.indexOf('/');
+    }
+
+    for (const candidate of candidates) {
+        const config = normalizePricingConfig(modelPrices[candidate]);
+        if (config && hasConfiguredPricingValue(config)) {
+            return {
+                model_name: candidate,
+                config,
+                is_fallback: candidate !== normalizedModelName,
+            };
+        }
+    }
+
+    return null;
+}
+
 export function normalizeOptionalPricingNumber(value) {
     if (value === null || value === undefined || value === '') {
         return null;
@@ -380,10 +415,12 @@ export function buildEstimatedPrice(run, settings) {
     const modelPrices = settings?.pricing?.model_prices && typeof settings.pricing.model_prices === 'object'
         ? settings.pricing.model_prices
         : {};
-    const config = normalizePricingConfig(modelPrices[modelName]);
-    if (!config || !hasConfiguredPricingValue(config)) {
+    const pricingEntry = resolvePricingModelEntry(modelName, modelPrices);
+    if (!pricingEntry) {
         return null;
     }
+
+    const config = pricingEntry.config;
 
     const usage = run?.response_usage;
     if (!usage || typeof usage !== 'object') {
@@ -465,6 +502,11 @@ export function buildEstimatedPrice(run, settings) {
     const pricingNote = noteParts.length >= 2
         ? `已按${noteParts.join('、')}估算`
         : (noteParts[0] ? `当前仅按${noteParts[0]}估算` : '当前按已配置价格估算');
+    // 沿用别的名字算钱时必须说出来。悄悄回退算出的金额可能偏低（例如付费档套用了普通档单价），
+    // 不写明就看不出来。
+    const pricingSourceNote = pricingEntry.is_fallback
+        ? `${pricingNote}。这个模型没有单独配价，沿用了 ${pricingEntry.model_name} 的价格`
+        : pricingNote;
 
     return {
         currency: config.currency,
@@ -475,7 +517,9 @@ export function buildEstimatedPrice(run, settings) {
         output_cost: outputCost,
         cached_input_tokens: boundedCachedInputTokens,
         regular_input_tokens: regularInputTokens,
-        note: pricingNote,
+        note: pricingSourceNote,
+        pricing_model_name: pricingEntry.model_name,
+        pricing_is_fallback: pricingEntry.is_fallback,
     };
 }
 
@@ -487,8 +531,7 @@ export function buildAbnormalBillingDetail(run, settings) {
     const modelPrices = settings?.pricing?.model_prices && typeof settings.pricing.model_prices === 'object'
         ? settings.pricing.model_prices
         : {};
-    const config = normalizePricingConfig(modelPrices[modelName]);
-    const hasPricingConfig = Boolean(config && hasConfiguredPricingValue(config));
+    const hasPricingConfig = Boolean(resolvePricingModelEntry(modelName, modelPrices));
     const estimatedPrice = buildEstimatedPrice(run, settings);
     const isPaidIncomplete = hasUsageTokens;
 
