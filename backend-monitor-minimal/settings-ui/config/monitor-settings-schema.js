@@ -13,6 +13,10 @@ export const monitorSettingsSchema = {
             default: cloneMonitorSettingsDefaults().runtime.runtime_mode,
             values: MONITOR_RUNTIME_MODES,
         },
+        collect_force_stop_diagnostics: {
+            type: 'boolean',
+            default: cloneMonitorSettingsDefaults().runtime.collect_force_stop_diagnostics,
+        },
     },
     display: {
         show_abnormal_optimization_suggestions: {

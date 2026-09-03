@@ -1238,7 +1238,9 @@ function buildGenerationStopStatusText(stopResult, unlockResult, rescueMode) {
     }
 
     if (unlockResult.selfRecovered) {
-        parts.push("酒馆已自行解除生成锁，发送按钮可用");
+        // 这条分支一个恢复动作都没做，依据只是四个锁标志都没读到值。
+        // 标志没体现锁不等于界面真的可用，所以这里只能陈述依据，不能报成功。
+        parts.push("没检测到酒馆的生成锁，因此没做强制恢复；发送键若仍然点不动，刷新页面");
         return parts.join("；");
     }
 
@@ -1353,6 +1355,10 @@ function sendClientStopSignal() {
 }
 
 function sendForceStopDiagnostics(record) {
+    if (!state.settings?.runtime?.collect_force_stop_diagnostics) {
+        return;
+    }
+
     // 旁路上报：诊断写不进去也不能影响终止结果，所以这里把所有失败都吞掉。
     try {
         void fetchJson("/force-stop-diagnostics", {
@@ -6770,8 +6776,11 @@ function buildWaitingQueueViewHtml() {
 
 function buildSettingsContentHtml() {
     const displaySettings = state.settings?.display ?? {};
+    const runtimeSettings = state.settings?.runtime ?? {};
     const permissionLevel = state.status?.permission_level || state.status?.effective_runtime_mode || "no_backend";
     const disableEnhancedToggle = permissionLevel === "no_backend";
+    // 精简版没有落盘的地方，这个开关开了也不会有记录，所以整项不显示。
+    const supportsForceStopDiagnostics = permissionLevel !== "no_backend";
     const pricingModels = collectPricingModels();
     const localOnlyPricedModels = new Set(getLocalOnlyPricedModels());
     const outputCardFields = getOutputCardFields();
@@ -6794,6 +6803,13 @@ function buildSettingsContentHtml() {
                     <input id="stlp_show_permission_enhanced_suggestions" type="checkbox" ${displaySettings.show_permission_enhanced_suggestions ? "checked" : ""} ${(state.isSaving || disableEnhancedToggle) ? "disabled" : ""} />
                     <span>显示权限增强建议</span>
                 </label>
+                ${supportsForceStopDiagnostics ? `
+                <label class="checkbox_label stlp-settings-toggle">
+                    <input id="stlp_collect_force_stop_diagnostics" type="checkbox" ${runtimeSettings.collect_force_stop_diagnostics ? "checked" : ""} ${state.isSaving ? "disabled" : ""} />
+                    <span>采集一键终止诊断</span>
+                </label>
+                <div class="stlp-note">排查用，默认关。开启后每次点「一键终止」会往 latency-monitor 目录写一条现场快照，供定位终止为什么没生效。这个文件只增不清，排查完记得关掉。</div>
+                ` : ""}
                 <label class="stlp-number">
                     <span>建议条数上限</span>
                     <input id="stlp_abnormal_optimization_suggestion_limit" type="number" min="2" max="4" step="1" value="${escapeHtml(displaySettings.abnormal_optimization_suggestion_limit ?? 3)}" ${state.isSaving ? "disabled" : ""} />
@@ -8364,6 +8380,15 @@ function handlePanelChangeTarget(target) {
         updateMonitorSettings({
             display: {
                 show_permission_enhanced_suggestions: Boolean(target.checked),
+            },
+        }, { deferBusyRender: true, optimistic: true });
+        return true;
+    }
+
+    if (target.id === "stlp_collect_force_stop_diagnostics") {
+        updateMonitorSettings({
+            runtime: {
+                collect_force_stop_diagnostics: Boolean(target.checked),
             },
         }, { deferBusyRender: true, optimistic: true });
         return true;

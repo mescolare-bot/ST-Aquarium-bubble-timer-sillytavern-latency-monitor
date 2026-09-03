@@ -22,6 +22,8 @@ export const PRICING_DISPLAY_CURRENCIES = [
 export const monitorSettingsDefaults = {
     runtime: {
         runtime_mode: 'auto',
+        // 默认关：诊断记录落在本机磁盘上，只有排查一键终止时才需要，平时开着没有收益。
+        collect_force_stop_diagnostics: false,
     },
     display: {
         show_abnormal_optimization_suggestions: true,
