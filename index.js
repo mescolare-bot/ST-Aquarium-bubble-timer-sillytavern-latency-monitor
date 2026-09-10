@@ -109,6 +109,9 @@ const DEFAULT_UI_SETTINGS = {
     pricingPanelOpenStates: {},
     pricingPeakValleyOpenStates: {},
     outputCardFields: DEFAULT_OUTPUT_CARD_FIELDS,
+    callTimer: { running: false, startedAtMs: 0, stoppedAtMs: 0 },
+    callTimerSessions: [],
+    callTimerExpectedSources: [],
 };
 
 const PERMISSION_LABELS = {
@@ -155,6 +158,32 @@ const GENERATION_TYPE_LABELS = {
     impersonate: "替我说",
     quiet: "后台静默",
 };
+
+// 区间统计：清点一段时间内一共发生了多少次调用、分别是谁发的。
+//
+// 窗口边界由用户手动划定，不做自动分轮。原因是拓展调用不走酒馆 Generate()，
+// 收不到生成事件（见文件顶部关于生成事件的注释），调用经常发生在 GENERATION_ENDED
+// 之后，自动分轮必须"延后关闭"，那个 TTL 设多少都是拍脑袋。手动计时反而没有猜测成分。
+const CALL_TIMER_MAX_SESSIONS = 10;
+// 和两种后端的单页上限一致：server-plugin 的 MAX_RUNS_PAGE_LIMIT 与 lite/local-api.js 同名常量。
+const CALL_TIMER_RUNS_LIMIT = 2000;
+// run 是请求结束才落盘的，按下停止时可能还有调用在飞，停表后按这两个间隔各补捞一次。
+// 补捞只影响显示，不改窗口边界。
+// 记录是生成结束才落盘的，而一次生成可能要两分钟以上（实测上游首字节等待中位数
+// 就有 120 秒）。原来的 3 秒 / 10 秒是按"一次生成十几秒"定的，停表时记录还没写进
+// 文件，补捞必然是空的。
+const CALL_TIMER_REFETCH_DELAYS_MS = [15000, 60000, 180000];
+// 计时期间的轮询：不轮询的话，页面显示的永远是按下"开始计时"那一刻的空快照。
+const CALL_TIMER_POLL_INTERVAL_MS = 10000;
+// 轮询不能拉满 2000 条——那一次约 2.5 MB。计时窗口内的记录数量有限，
+// 最新 200 条足够覆盖，约 250 KB。
+const CALL_TIMER_POLL_RUNS_LIMIT = 200;
+const CALL_TIMER_EXPECTED_SOURCE_LIMIT = 50;
+// 明细上限只是防呆：一次生成通常十几条，但窗口拉长后可能有上千条，全渲染会卡住面板。
+const CALL_TIMER_DETAIL_LIMIT = 300;
+const CALL_TIMER_SOURCE_QUIET = "后台静默（总结/向量等）";
+const CALL_TIMER_SOURCE_UNKNOWN_PLUGIN = "未知拓展调用";
+const CALL_TIMER_SOURCE_MAIN_REPLY = "正文回复";
 
 const REQUEST_PLUGIN_MATCH_MODE_LABELS = {
     explicit: "调用方显式上报",
@@ -445,6 +474,20 @@ const state = {
     lastSeenAbnormalRunId: "",
     abnormalAlertInitialized: false,
     settingsSubsectionOpenStates: { ...DEFAULT_SETTINGS_SUBSECTION_OPEN_STATES },
+    callTimerRuns: [],
+    callTimerLoading: false,
+    callTimerError: "",
+    callTimerTruncated: false,
+    callTimerFetchedAtMs: 0,
+    // 这一批记录是按多大的 limit 取回来的：轮询用小包，截断提示要照实报这个数。
+    callTimerLoadedLimit: CALL_TIMER_RUNS_LIMIT,
+    callTimerRefetchTimerIds: [],
+    callTimerTickTimerId: null,
+    callTimerPollTimerId: null,
+    // 回看中的历史区间。只活在内存里：刷新后收起，本次计时不受它影响。
+    callTimerHistorySessionId: "",
+    // 两张卡片各自的"逐条明细"折叠状态，取值 "current" / "history"。
+    callTimerExpandedDetailScopes: new Set(),
 };
 
 function loadUiSettings() {
@@ -485,6 +528,9 @@ function loadUiSettings() {
             pricingPanelOpenStates: parsed?.pricingPanelOpenStates && typeof parsed.pricingPanelOpenStates === "object" ? parsed.pricingPanelOpenStates : {},
             pricingPeakValleyOpenStates: parsed?.pricingPeakValleyOpenStates && typeof parsed.pricingPeakValleyOpenStates === "object" ? parsed.pricingPeakValleyOpenStates : {},
             outputCardFields: normalizeOutputCardFields(parsed?.outputCardFields),
+            callTimer: normalizeCallTimer(parsed?.callTimer),
+            callTimerSessions: normalizeCallTimerSessions(parsed?.callTimerSessions),
+            callTimerExpectedSources: normalizeCallTimerExpectedSources(parsed?.callTimerExpectedSources),
         };
     } catch {
         return { ...DEFAULT_UI_SETTINGS };
@@ -523,7 +569,72 @@ function filterRunsByRequestPurpose(runs, requestPurpose = getActiveRequestPurpo
 }
 
 function normalizeMainViewMode(value) {
-    return value === "settings" || value === "status" || value === "waiting_queue" || value === "daily_summary" ? value : "monitor";
+    return value === "settings" || value === "status" || value === "waiting_queue" || value === "daily_summary" || value === "call_timer" ? value : "monitor";
+}
+
+function normalizeTimestampMs(value) {
+    const parsed = Math.trunc(Number(value));
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function createCallTimerSessionId() {
+    return `ct-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function normalizeCallTimer(value) {
+    const startedAtMs = normalizeTimestampMs(value?.startedAtMs);
+    // 没有开始时间就谈不上"在跑"：窗口下界会变成 0，把全部历史都算进这一次里。
+    const running = value?.running === true && startedAtMs > 0;
+    return {
+        running,
+        startedAtMs,
+        stoppedAtMs: running ? 0 : normalizeTimestampMs(value?.stoppedAtMs),
+    };
+}
+
+function normalizeCallTimerSessions(value) {
+    if (!Array.isArray(value)) {
+        return [];
+    }
+
+    const sessions = [];
+    for (const item of value) {
+        const startedAtMs = normalizeTimestampMs(item?.startedAtMs);
+        const stoppedAtMs = normalizeTimestampMs(item?.stoppedAtMs);
+        if (!startedAtMs || !stoppedAtMs || stoppedAtMs < startedAtMs) {
+            continue;
+        }
+
+        sessions.push({
+            id: typeof item?.id === "string" && item.id.trim()
+                ? item.id.trim().slice(0, 80)
+                : createCallTimerSessionId(),
+            startedAtMs,
+            stoppedAtMs,
+        });
+    }
+
+    return sessions.slice(0, CALL_TIMER_MAX_SESSIONS);
+}
+
+function normalizeCallTimerExpectedSources(value) {
+    if (!Array.isArray(value)) {
+        return [];
+    }
+
+    const seen = new Set();
+    const sources = [];
+    for (const item of value) {
+        const label = typeof item === "string" ? item.trim().slice(0, 120) : "";
+        if (!label || seen.has(label)) {
+            continue;
+        }
+
+        seen.add(label);
+        sources.push(label);
+    }
+
+    return sources.slice(0, CALL_TIMER_EXPECTED_SOURCE_LIMIT);
 }
 
 function normalizeDailySummaryDays(value) {
@@ -1679,6 +1790,16 @@ function isDailySummaryView() {
     return normalizeMainViewMode(state.uiSettings.activeMainView) === "daily_summary";
 }
 
+function isCallTimerView() {
+    return normalizeMainViewMode(state.uiSettings.activeMainView) === "call_timer";
+}
+
+// 别再逐个枚举侧栏页面了：之前漏掉新加的 call_timer，导致在区间统计页上
+// 点当前已选中的用途跳不回主监控页。
+function isMonitorView() {
+    return normalizeMainViewMode(state.uiSettings.activeMainView) === "monitor";
+}
+
 function isExtensionRequestView() {
     return getActiveRequestPurpose() === "non_chat_generation";
 }
@@ -1796,7 +1917,7 @@ function getDailySummaryScopeInfo() {
 async function setActiveRequestPurpose(nextPurpose) {
     const normalizedPurpose = normalizeRequestPurposeMode(nextPurpose);
     if (normalizedPurpose === getActiveRequestPurpose()) {
-        if (isSettingsView() || isStatusView() || isWaitingQueueView() || isDailySummaryView()) {
+        if (!isMonitorView()) {
             state.uiSettings.activeMainView = "monitor";
             restoreMonitorSectionLayout();
             saveUiSettings();
@@ -1865,6 +1986,336 @@ function openDailySummarySection() {
     saveUiSettings();
     safeRenderPage();
     void refreshBackendData({ silent: true });
+}
+
+function openCallTimerSection() {
+    if (isCallTimerView()) {
+        return;
+    }
+
+    state.uiSettings.activeMainView = "call_timer";
+    saveUiSettings();
+    safeRenderPage();
+    void loadCallTimerRuns({ silent: true });
+}
+
+function getCallTimerWindow() {
+    const timer = normalizeCallTimer(state.uiSettings.callTimer);
+    return {
+        running: timer.running,
+        startedAtMs: timer.startedAtMs,
+        // 还在走表时上界取"此刻"，停了就用停表时刻。
+        endMs: timer.running ? Date.now() : (timer.stoppedAtMs || timer.startedAtMs),
+    };
+}
+
+function formatCallTimerDuration(ms) {
+    const totalSeconds = Math.max(0, Math.floor(Number(ms) / 1000));
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    const pad = (value) => String(value).padStart(2, "0");
+    return hours ? `${hours}:${pad(minutes)}:${pad(seconds)}` : `${minutes}:${pad(seconds)}`;
+}
+
+function clearCallTimerRefetchTimers() {
+    for (const timerId of state.callTimerRefetchTimerIds) {
+        clearTimeout(timerId);
+    }
+    state.callTimerRefetchTimerIds = [];
+}
+
+// run 是请求结束才落盘的，停表那一刻还在飞的调用尚未进库。
+// 按 CALL_TIMER_REFETCH_DELAYS_MS 各补捞一次，只影响显示，不改窗口边界。
+function scheduleCallTimerRefetch() {
+    clearCallTimerRefetchTimers();
+    state.callTimerRefetchTimerIds = CALL_TIMER_REFETCH_DELAYS_MS.map((delayMs) => setTimeout(() => {
+        runSafely("补捞区间统计记录", () => {
+            void loadCallTimerRuns({ silent: true });
+        });
+    }, delayMs));
+}
+
+function stopCallTimerTick() {
+    if (state.callTimerTickTimerId !== null) {
+        clearInterval(state.callTimerTickTimerId);
+        state.callTimerTickTimerId = null;
+    }
+}
+
+function stopCallTimerPoll() {
+    if (state.callTimerPollTimerId !== null) {
+        clearInterval(state.callTimerPollTimerId);
+        state.callTimerPollTimerId = null;
+    }
+}
+
+// 计时期间定时补数据。只在本页且正在走表时开，页面藏起来时跳过这一轮，
+// 免得后台标签页一直空跑请求。
+function syncCallTimerPoll() {
+    if (!isCallTimerView() || !getCallTimerWindow().running) {
+        stopCallTimerPoll();
+        return;
+    }
+
+    if (state.callTimerPollTimerId !== null) {
+        return;
+    }
+
+    state.callTimerPollTimerId = setInterval(() => {
+        runSafely("轮询区间统计记录", () => {
+            // 面板关掉后不会再重渲染，光看 isCallTimerView 会一直空转，
+            // 所以跟走表读数一样以"节点还在不在"为准。
+            if (!isCallTimerView()
+                || !getCallTimerWindow().running
+                || !state.pageRoot?.querySelector("[data-call-timer-elapsed]")) {
+                stopCallTimerPoll();
+                return;
+            }
+
+            if (document.hidden) {
+                return;
+            }
+
+            void loadCallTimerRuns({ silent: true, limit: CALL_TIMER_POLL_RUNS_LIMIT });
+        });
+    }, CALL_TIMER_POLL_INTERVAL_MS);
+}
+
+// 走表期间只改那一处读数，不整页重渲染：重渲染会打断页面上的滚动和输入。
+function syncCallTimerTick() {
+    if (!isCallTimerView() || !getCallTimerWindow().running) {
+        stopCallTimerTick();
+        return;
+    }
+
+    if (state.callTimerTickTimerId !== null) {
+        return;
+    }
+
+    state.callTimerTickTimerId = setInterval(() => {
+        runSafely("刷新区间计时读数", () => {
+            const element = state.pageRoot?.querySelector("[data-call-timer-elapsed]");
+            if (!element) {
+                stopCallTimerTick();
+                return;
+            }
+
+            const timerWindow = getCallTimerWindow();
+            element.textContent = formatCallTimerDuration(timerWindow.endMs - timerWindow.startedAtMs);
+        });
+    }, 1000);
+}
+
+function startCallTimer() {
+    state.uiSettings.callTimer = { running: true, startedAtMs: Date.now(), stoppedAtMs: 0 };
+    saveUiSettings();
+    clearCallTimerRefetchTimers();
+    safeRenderPage();
+    void loadCallTimerRuns({ silent: true });
+}
+
+function stopCallTimer() {
+    const timer = normalizeCallTimer(state.uiSettings.callTimer);
+    if (!timer.running) {
+        return;
+    }
+
+    const stoppedAtMs = Date.now();
+    state.uiSettings.callTimer = { running: false, startedAtMs: timer.startedAtMs, stoppedAtMs };
+    state.uiSettings.callTimerSessions = normalizeCallTimerSessions([
+        { id: createCallTimerSessionId(), startedAtMs: timer.startedAtMs, stoppedAtMs },
+        ...(Array.isArray(state.uiSettings.callTimerSessions) ? state.uiSettings.callTimerSessions : []),
+    ]);
+    saveUiSettings();
+    safeRenderPage();
+    void loadCallTimerRuns({ silent: true });
+    scheduleCallTimerRefetch();
+}
+
+// 只丢掉当前这段窗口，历史区间列表和后端记录都不动。
+// 走表途中点它等于放弃这一段：不会写进历史区间。
+function clearCallTimerWindow() {
+    state.uiSettings.callTimer = { running: false, startedAtMs: 0, stoppedAtMs: 0 };
+    saveUiSettings();
+    clearCallTimerRefetchTimers();
+    stopCallTimerPoll();
+    stopCallTimerTick();
+    safeRenderPage();
+}
+
+// 回看历史区间只切这个 id，绝不去动 state.uiSettings.callTimer。
+// 早先的写法是把窗口整个挪过去，正在走表时点一下就把这段计时抹了，而且
+// 一个页面只能看一样东西。现在本次和历史是两个独立窗口，各渲染各的卡片。
+function viewCallTimerSession(sessionId) {
+    const session = normalizeCallTimerSessions(state.uiSettings.callTimerSessions)
+        .find((item) => item.id === sessionId);
+    if (!session) {
+        return;
+    }
+
+    // 点已经展开的那一段等于收起。
+    state.callTimerHistorySessionId = state.callTimerHistorySessionId === session.id ? "" : session.id;
+    state.callTimerExpandedDetailScopes.delete("history");
+    safeRenderPage();
+}
+
+// 取当前回看的那一段。段可能已被 CALL_TIMER_MAX_SESSIONS 挤掉，顺手清掉悬空 id。
+function getCallTimerHistorySession() {
+    if (!state.callTimerHistorySessionId) {
+        return null;
+    }
+
+    const session = normalizeCallTimerSessions(state.uiSettings.callTimerSessions)
+        .find((item) => item.id === state.callTimerHistorySessionId);
+    if (!session) {
+        state.callTimerHistorySessionId = "";
+        return null;
+    }
+
+    return session;
+}
+
+// 把历史段包装成和 getCallTimerWindow() 同形状的窗口，好让取数逻辑不分彼此。
+function getCallTimerSessionWindow(session) {
+    return {
+        running: false,
+        startedAtMs: session.startedAtMs,
+        endMs: session.stoppedAtMs || session.startedAtMs,
+    };
+}
+
+function isCallTimerDetailExpanded(scope) {
+    return state.callTimerExpandedDetailScopes.has(scope);
+}
+
+function toggleCallTimerDetail(scope) {
+    if (scope !== "current" && scope !== "history") {
+        return;
+    }
+
+    if (state.callTimerExpandedDetailScopes.has(scope)) {
+        state.callTimerExpandedDetailScopes.delete(scope);
+    } else {
+        state.callTimerExpandedDetailScopes.add(scope);
+    }
+
+    safeRenderPage();
+}
+
+async function loadCallTimerRuns({ silent = false, limit = CALL_TIMER_RUNS_LIMIT } = {}) {
+    if (state.callTimerLoading) {
+        return;
+    }
+
+    state.callTimerLoading = true;
+    if (!silent) {
+        safeRenderPage();
+    }
+
+    try {
+        // 不带 purpose 就是不筛选，一次拿到全部三种用途；offset=0 拿到的是最新的 N 条。
+        const result = await fetchJson(`/runs?limit=${limit}&offset=0`);
+        state.callTimerRuns = Array.isArray(result?.runs) ? result.runs : [];
+        state.callTimerLoadedLimit = limit;
+        state.callTimerTruncated = state.callTimerRuns.length >= limit;
+        state.callTimerFetchedAtMs = Date.now();
+        state.callTimerError = "";
+    } catch (error) {
+        state.callTimerError = error instanceof Error ? error.message : String(error);
+    } finally {
+        state.callTimerLoading = false;
+        safeRenderPage();
+    }
+}
+
+function getCallTimerRunsInWindow(timerWindow) {
+    if (!timerWindow?.startedAtMs) {
+        return [];
+    }
+
+    return state.callTimerRuns
+        .filter((run) => {
+            const startedAtMs = normalizeTimestampMs(run?.started_at_ms);
+            return startedAtMs >= timerWindow.startedAtMs && startedAtMs <= timerWindow.endMs;
+        })
+        .sort((left, right) => normalizeTimestampMs(right?.started_at_ms) - normalizeTimestampMs(left?.started_at_ms));
+}
+
+// 只取到最新 N 条，若窗口起点比最老一条还早，这次统计就是不完整的。
+// 这种情况必须说出来，静默少算比不算更糟。
+function isCallTimerWindowTruncated(timerWindow) {
+    if (!state.callTimerTruncated || !state.callTimerRuns.length || !timerWindow?.startedAtMs) {
+        return false;
+    }
+
+    const oldestStartedAtMs = state.callTimerRuns.reduce((oldest, run) => {
+        const startedAtMs = normalizeTimestampMs(run?.started_at_ms);
+        return startedAtMs && (!oldest || startedAtMs < oldest) ? startedAtMs : oldest;
+    }, 0);
+
+    return Boolean(oldestStartedAtMs) && timerWindow.startedAtMs < oldestStartedAtMs;
+}
+
+function getCallTimerRunSourceLabel(run) {
+    const pluginLabel = getRunPluginLabel(run);
+    if (pluginLabel) {
+        return pluginLabel;
+    }
+
+    // 内置的总结/向量等走酒馆管线，落在 quiet 生成类型上，它们不是"拓展自己发的调用"。
+    if (normalizeGenerationType(run?.request_generation_type) === "quiet") {
+        return CALL_TIMER_SOURCE_QUIET;
+    }
+
+    // 这里必须看原始值：normalizeRequestPurposeMode 只区分两种，
+    // 会把 plugin_internal_request 一并压成 chat_main_reply，归组就错了。
+    const rawPurpose = typeof run?.request_purpose === "string" ? run.request_purpose.trim() : "";
+    if (rawPurpose === "non_chat_generation" || rawPurpose === "plugin_internal_request") {
+        return CALL_TIMER_SOURCE_UNKNOWN_PLUGIN;
+    }
+
+    return CALL_TIMER_SOURCE_MAIN_REPLY;
+}
+
+function buildCallTimerGroups(runs) {
+    const groups = new Map();
+    for (const run of runs) {
+        const label = getCallTimerRunSourceLabel(run);
+        const group = groups.get(label) ?? { label, count: 0 };
+        group.count += 1;
+        groups.set(label, group);
+    }
+
+    return [...groups.values()].sort((left, right) => (
+        right.count - left.count || left.label.localeCompare(right.label, "zh-Hans-CN")
+    ));
+}
+
+// 期望名单不让用户手打：把这一次出现过的来源直接存下来当基线。
+function saveCallTimerExpectedSources() {
+    const groups = buildCallTimerGroups(getCallTimerRunsInWindow(getCallTimerWindow()));
+    state.uiSettings.callTimerExpectedSources = normalizeCallTimerExpectedSources(
+        groups.map((group) => group.label),
+    );
+    saveUiSettings();
+    safeRenderPage();
+}
+
+function clearCallTimerExpectedSources() {
+    state.uiSettings.callTimerExpectedSources = [];
+    saveUiSettings();
+    safeRenderPage();
+}
+
+function getCallTimerMissingSources(groups) {
+    const expected = normalizeCallTimerExpectedSources(state.uiSettings.callTimerExpectedSources);
+    if (!expected.length) {
+        return [];
+    }
+
+    const present = new Set(groups.map((group) => group.label));
+    return expected.filter((label) => !present.has(label));
 }
 
 function getWaitingQueueDraftValue(entry) {
@@ -3185,10 +3636,18 @@ function findRunById(runId) {
         ...state.historyRuns,
         ...state.historyAllRuns,
         ...state.filteredRuns,
+        ...state.callTimerRuns,
         ...state.waitingQueueEntries.map((entry) => entry?.run).filter(Boolean),
     ];
 
     return allRuns.find((run) => run?.id === runId) ?? null;
+}
+
+// 展开态清理原来在三处各写各的判断，漏掉哪个数组，那一页的卡片就会被判成
+// "已卸载"而自己合上——区间统计每 10 秒轮询一次，表现就是卡片不停跳掉。
+// 统一成一个"到处找一遍"，宁可多留一会儿也不要误清。
+function isRunLoadedAnywhere(runId) {
+    return Boolean(findRunById(runId));
 }
 
 function getWaitingQueueEntry(runId) {
@@ -6120,15 +6579,11 @@ async function refreshBackendData({ silent = false } = {}) {
                 }
             }
         }
-        const isRunStillLoaded = (runId) => (
-            state.runs.some((run) => run?.id === runId)
-            || state.filteredRuns.some((run) => run?.id === runId)
-        );
         state.expandedRunIds = new Set(
-            Array.from(state.expandedRunIds).filter(isRunStillLoaded),
+            Array.from(state.expandedRunIds).filter(isRunLoadedAnywhere),
         );
         state.expandedSuggestionRunIds = new Set(
-            Array.from(state.expandedSuggestionRunIds).filter(isRunStillLoaded),
+            Array.from(state.expandedSuggestionRunIds).filter(isRunLoadedAnywhere),
         );
         state.backendReady = true;
         state.apiError = "";
@@ -6174,16 +6629,10 @@ async function loadHistoryPage(page) {
         state.historyTotal = Math.max(Number(result?.total) || 0, state.historyRuns.length);
         syncHistorySelectionToLoadedRuns();
         state.expandedRunIds = new Set(
-            Array.from(state.expandedRunIds).filter((runId) => (
-                state.runs.some((run) => run?.id === runId)
-                || state.historyRuns.some((run) => run?.id === runId)
-            )),
+            Array.from(state.expandedRunIds).filter(isRunLoadedAnywhere),
         );
         state.expandedSuggestionRunIds = new Set(
-            Array.from(state.expandedSuggestionRunIds).filter((runId) => (
-                state.runs.some((run) => run?.id === runId)
-                || state.historyRuns.some((run) => run?.id === runId)
-            )),
+            Array.from(state.expandedSuggestionRunIds).filter(isRunLoadedAnywhere),
         );
     } catch (error) {
         state.historyError = error instanceof Error ? error.message : String(error);
@@ -6211,18 +6660,10 @@ async function loadAllHistoryRuns() {
         state.historyTotal = Math.max(Number(result?.total) || 0, state.historyAllRuns.length, state.historyTotal);
         syncHistorySelectionToLoadedRuns();
         state.expandedRunIds = new Set(
-            Array.from(state.expandedRunIds).filter((runId) => (
-                state.runs.some((run) => run?.id === runId)
-                || state.historyRuns.some((run) => run?.id === runId)
-                || state.historyAllRuns.some((run) => run?.id === runId)
-            )),
+            Array.from(state.expandedRunIds).filter(isRunLoadedAnywhere),
         );
         state.expandedSuggestionRunIds = new Set(
-            Array.from(state.expandedSuggestionRunIds).filter((runId) => (
-                state.runs.some((run) => run?.id === runId)
-                || state.historyRuns.some((run) => run?.id === runId)
-                || state.historyAllRuns.some((run) => run?.id === runId)
-            )),
+            Array.from(state.expandedSuggestionRunIds).filter(isRunLoadedAnywhere),
         );
     } catch (error) {
         state.historyError = error instanceof Error ? error.message : String(error);
@@ -7274,6 +7715,172 @@ function isDailySummaryRowExpanded(dateKey) {
         : false;
 }
 
+function buildCallTimerDetailRowHtml(run) {
+    const generationTypeLabel = getRunGenerationTypeLabel(run);
+    const purposeLabel = getRequestPurposeLabel(run?.request_purpose);
+    const runId = run?.id || "";
+    // 展开态和历史记录共用 state.expandedRunIds：同一条记录在哪一页展开都一致，
+    // 也省得再维护一套清理逻辑。
+    const expanded = state.expandedRunIds.has(runId);
+    return `
+        <div class="stlp-call-timer-row ${expanded ? "is-expanded" : ""}">
+            <div class="stlp-call-timer-cell stlp-call-timer-cell-time">${escapeHtml(formatStartedAtCompact(run?.started_at_iso))}</div>
+            <div class="stlp-call-timer-cell">${escapeHtml(generationTypeLabel ? `${purposeLabel} · ${generationTypeLabel}` : purposeLabel)}</div>
+            <div class="stlp-call-timer-cell stlp-call-timer-cell-source">${escapeHtml(getCallTimerRunSourceLabel(run))}</div>
+            <div class="stlp-call-timer-cell stlp-call-timer-cell-model">${escapeHtml(run?.model || "未记录模型")}</div>
+            <div class="stlp-call-timer-cell stlp-call-timer-cell-duration">${escapeHtml(formatSeconds(run?.metrics?.total_ms))}</div>
+            <div class="stlp-call-timer-cell stlp-call-timer-cell-expand">
+                <button class="menu_button stlp-call-timer-expand-button ${expanded ? "is-expanded" : ""}" type="button" data-action="toggle-run" data-run-id="${escapeHtml(runId)}" aria-expanded="${expanded ? "true" : "false"}" aria-label="${expanded ? "收起这条详情" : "展开这条详情"}" title="${expanded ? "收起这条详情" : "展开这条详情"}">
+                    <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </button>
+            </div>
+        </div>
+        ${expanded ? `<div class="stlp-call-timer-detail-card">${buildRunHtml(run, { showSummary: false })}</div>` : ""}
+    `;
+}
+
+// 本次和历史两张卡片显示的内容完全一样，只是窗口不同，所以共用这一份。
+// scope 只用来把两边的"逐条明细"折叠状态分开，取值 "current" / "history"。
+function buildCallTimerStatsHtml(timerWindow, scope) {
+    const runs = getCallTimerRunsInWindow(timerWindow);
+    const groups = buildCallTimerGroups(runs);
+    const detailRuns = runs.slice(0, CALL_TIMER_DETAIL_LIMIT);
+    const detailExpanded = isCallTimerDetailExpanded(scope);
+
+    return `
+        <div class="stlp-settings-subtitle">这段时间内共 ${runs.length} 次调用</div>
+        ${groups.length
+            ? `<div class="stlp-call-timer-groups">${groups.map((group) => `
+                <div class="stlp-call-timer-group">
+                    <span class="stlp-call-timer-group-label">${escapeHtml(group.label)}</span>
+                    <span class="stlp-badge">${group.count} 次</span>
+                </div>
+            `).join("")}</div>
+               ${state.recordSourceMode === "lite" ? `<div class="stlp-note">精简版没有后端指纹，拓展要先在等待区手动标注一次才认得出来，否则会归到"${escapeHtml(CALL_TIMER_SOURCE_UNKNOWN_PLUGIN)}"。</div>` : ""}`
+            : `<div class="stlp-waiting-empty">这段时间内没有任何调用记录。</div>
+               ${timerWindow.running ? `<div class="stlp-note">记录是在一次调用<strong>结束</strong>时才落盘的，所以生成还没跑完时这里是空的，属正常。页面每 ${Math.round(CALL_TIMER_POLL_INTERVAL_MS / 1000)} 秒自动补一次数据。</div>` : ""}`}
+
+        ${detailRuns.length ? `
+            <div class="stlp-call-timer-details">
+                <button class="stlp-call-timer-detail-bar ${detailExpanded ? "is-expanded" : ""}" type="button" data-action="toggle-call-timer-details" data-call-timer-scope="${escapeHtml(scope)}" aria-expanded="${detailExpanded ? "true" : "false"}">
+                    <span class="stlp-call-timer-detail-bar-label">逐条明细 · ${runs.length} 条</span>
+                    <span class="stlp-call-timer-detail-bar-icon ${detailExpanded ? "is-expanded" : ""}">${getChevronIconSvg()}</span>
+                </button>
+                ${detailExpanded ? `
+                    <div class="stlp-call-timer-table">
+                        <div class="stlp-call-timer-row stlp-call-timer-row-head">
+                            <div class="stlp-call-timer-cell stlp-call-timer-cell-time">时间</div>
+                            <div class="stlp-call-timer-cell">类型</div>
+                            <div class="stlp-call-timer-cell stlp-call-timer-cell-source">来源</div>
+                            <div class="stlp-call-timer-cell stlp-call-timer-cell-model">模型</div>
+                            <div class="stlp-call-timer-cell stlp-call-timer-cell-duration">耗时</div>
+                            <div class="stlp-call-timer-cell stlp-call-timer-cell-expand"></div>
+                        </div>
+                        ${detailRuns.map((run) => buildCallTimerDetailRowHtml(run)).join("")}
+                    </div>
+                    ${runs.length > detailRuns.length ? `<div class="stlp-note">条数太多，只列出最近 ${CALL_TIMER_DETAIL_LIMIT} 条，上面的计数仍是全部 ${runs.length} 条。</div>` : ""}
+                ` : ""}
+            </div>
+        ` : ""}
+    `;
+}
+
+function buildCallTimerViewHtml() {
+    const timerWindow = getCallTimerWindow();
+    const hasWindow = Boolean(timerWindow.startedAtMs);
+    const currentGroups = buildCallTimerGroups(getCallTimerRunsInWindow(timerWindow));
+    const expectedSources = normalizeCallTimerExpectedSources(state.uiSettings.callTimerExpectedSources);
+    const missingSources = getCallTimerMissingSources(currentGroups);
+    const sessions = normalizeCallTimerSessions(state.uiSettings.callTimerSessions);
+    const elapsedText = hasWindow ? formatCallTimerDuration(timerWindow.endMs - timerWindow.startedAtMs) : "0:00";
+    const historySession = getCallTimerHistorySession();
+    const historyWindow = historySession ? getCallTimerSessionWindow(historySession) : null;
+
+    return `
+        <section class="stlp-call-timer-view">
+            <div class="stlp-status-view-header">
+                <div class="stlp-status-view-title">区间统计</div>
+                <div class="stlp-note">数一段时间内一共发生了多少次调用、分别是谁发的，用来确认记忆书这类拓展是不是都触发过一遍。</div>
+            </div>
+
+            <div class="stlp-call-timer-card">
+                <div class="stlp-call-timer-card-title">本次区间</div>
+
+                <div class="stlp-call-timer-control">
+                    <div class="stlp-call-timer-readout">
+                        <div class="stlp-call-timer-elapsed" data-call-timer-elapsed>${escapeHtml(elapsedText)}</div>
+                        <div class="stlp-call-timer-range">${hasWindow
+                            ? `${escapeHtml(formatStartedAtCompact(new Date(timerWindow.startedAtMs).toISOString()))} 起${timerWindow.running ? "，计时中" : `，到 ${escapeHtml(formatStartedAtCompact(new Date(timerWindow.endMs).toISOString()))}`}`
+                            : "还没开始计时"}</div>
+                    </div>
+                    <div class="stlp-call-timer-buttons">
+                        ${timerWindow.running
+                            ? `<button class="menu_button stlp-inline-button" type="button" data-action="stop-call-timer">停止计时</button>`
+                            : `<button class="menu_button stlp-inline-button" type="button" data-action="start-call-timer">开始计时</button>`}
+                        <button class="menu_button stlp-inline-button" type="button" data-action="refresh-call-timer" ${state.callTimerLoading ? "disabled" : ""}>${state.callTimerLoading ? "刷新中" : "刷新"}</button>
+                        ${hasWindow ? `<button class="menu_button stlp-inline-button" type="button" data-action="clear-call-timer" title="丢掉当前这段计时，历史区间和调用记录都不受影响">清理本次</button>` : ""}
+                    </div>
+                </div>
+
+                ${state.callTimerError ? `<div class="stlp-waiting-copy">读取记录失败：${escapeHtml(state.callTimerError)}</div>` : ""}
+                ${isCallTimerWindowTruncated(timerWindow) ? `<div class="stlp-call-timer-warning">只取到最近 ${state.callTimerLoadedLimit} 条记录，而计时起点比其中最早的一条还早，这次统计并不完整。点"刷新"可以拉取更多。</div>` : ""}
+
+                ${hasWindow
+                    ? buildCallTimerStatsHtml(timerWindow, "current")
+                    : `<div class="stlp-waiting-empty">点"开始计时"划定一段时间，期间发生的调用都会被清点出来。</div>`}
+
+                <div class="stlp-call-timer-section">
+                    <div class="stlp-settings-subtitle">未触发清单</div>
+                    ${expectedSources.length ? `
+                        ${missingSources.length
+                            ? `<div class="stlp-call-timer-missing">${missingSources.map((label) => `<span class="stlp-badge stlp-badge-abnormal">${escapeHtml(label)}</span>`).join("")}</div>
+                               <div class="stlp-note">这些来源在期望名单里，但这段时间内没出现。</div>`
+                            : `<div class="stlp-note">期望名单里的 ${expectedSources.length} 个来源这段时间内都出现过。</div>`}
+                        <div class="stlp-waiting-card-actions">
+                            <button class="menu_button stlp-inline-button" type="button" data-action="save-call-timer-expected">用本次结果覆盖名单</button>
+                            <button class="menu_button stlp-inline-button" type="button" data-action="clear-call-timer-expected">清空名单</button>
+                        </div>
+                    ` : `
+                        <div class="stlp-note">先跑一次"全都该触发"的完整区间，把结果存成期望名单；之后每次计时都会拿当前结果和名单比对，缺的列在这里。名单按来源名称精确比对。只比对本次，不看历史区间。</div>
+                        <div class="stlp-waiting-card-actions">
+                            <button class="menu_button stlp-inline-button" type="button" data-action="save-call-timer-expected" ${currentGroups.length ? "" : "disabled"}>把本次出现的来源存为期望名单</button>
+                        </div>
+                    `}
+                </div>
+            </div>
+
+            ${sessions.length ? `
+                <div class="stlp-call-timer-card">
+                    <div class="stlp-call-timer-card-title">历史区间调用</div>
+                    <div class="stlp-call-timer-sessions">
+                        ${sessions.map((session) => {
+                            const active = session.id === state.callTimerHistorySessionId;
+                            return `
+                            <button class="menu_button stlp-inline-button ${active ? "is-active" : ""}" type="button" data-action="view-call-timer-session" data-session-id="${escapeHtml(session.id)}" aria-pressed="${active ? "true" : "false"}">
+                                ${escapeHtml(formatStartedAtCompact(new Date(session.startedAtMs).toISOString()))} · ${escapeHtml(formatCallTimerDuration(session.stoppedAtMs - session.startedAtMs))}
+                            </button>
+                        `;
+                        }).join("")}
+                    </div>
+                    <div class="stlp-note">点一段就在下面单独展开它的调用内容，上面那张"本次区间"不受影响，两边可以对着看。最多留 ${CALL_TIMER_MAX_SESSIONS} 段。</div>
+
+                    ${historySession ? `
+                        <div class="stlp-call-timer-history-detail">
+                            <div class="stlp-call-timer-history-detail-header">
+                                <div class="stlp-call-timer-history-detail-range">${escapeHtml(formatStartedAtCompact(new Date(historySession.startedAtMs).toISOString()))} 起，到 ${escapeHtml(formatStartedAtCompact(new Date(historySession.stoppedAtMs).toISOString()))}，历时 ${escapeHtml(formatCallTimerDuration(historySession.stoppedAtMs - historySession.startedAtMs))}</div>
+                                <button class="menu_button stlp-inline-button" type="button" data-action="view-call-timer-session" data-session-id="${escapeHtml(historySession.id)}">收起</button>
+                            </div>
+                            ${isCallTimerWindowTruncated(historyWindow) ? `<div class="stlp-call-timer-warning">只取到最近 ${state.callTimerLoadedLimit} 条记录，而这一段的起点比其中最早的一条还早，它的统计并不完整。点上面的"刷新"可以拉取更多。</div>` : ""}
+                            ${buildCallTimerStatsHtml(historyWindow, "history")}
+                        </div>
+                    ` : ""}
+                </div>
+            ` : ""}
+
+        </section>
+    `;
+}
+
 function buildDailySummaryViewHtml() {
     const dailySummary = state.dailySummary;
     const rows = Array.isArray(dailySummary?.rows) ? dailySummary.rows : [];
@@ -7642,7 +8249,9 @@ function buildHistoryDialogHtml() {
     `;
 }
 
-function buildRunHtml(run, { compactSummary = false, showWaitingQueueAction = true, showOutputCardAction = true } = {}) {
+// showSummary=false 用于外面已经有一行概要的场合（区间统计的明细表）：
+// 只铺详情，不再画一遍徽章行，否则同一条信息会紧挨着重复两遍。
+function buildRunHtml(run, { compactSummary = false, showWaitingQueueAction = true, showOutputCardAction = true, showSummary = true } = {}) {
     const abnormalDetail = run?.abnormal_detail;
     const abnormalBilling = getRunAbnormalBilling(run);
     const suggestions = abnormalDetail?.optimization_suggestions?.suggestions ?? [];
@@ -7772,6 +8381,7 @@ function buildRunHtml(run, { compactSummary = false, showWaitingQueueAction = tr
 
     return `
         <article class="stlp-run ${isAbnormalRun(run) ? "stlp-run-abnormal" : ""} ${compactSummary ? "stlp-run-compact" : ""}" data-run-id="${escapeHtml(run?.id || "")}">
+            ${showSummary ? `
             <div class="stlp-run-summary ${compactSummary ? `stlp-run-summary-compact ${showDeleteToggle ? "stlp-run-summary-with-select" : "stlp-run-summary-no-select"}` : ""}">
                 ${compactSummary
                     ? `
@@ -7795,6 +8405,7 @@ function buildRunHtml(run, { compactSummary = false, showWaitingQueueAction = tr
                         <span>总耗时 ${escapeHtml(formatSeconds(run?.metrics?.total_ms))}</span>
                     `}
             </div>
+            ` : ""}
             ${runActionButtonsHtml}
             <div class="stlp-run-body ${runOpen ? "" : "stlp-hidden"}">
                 <div class="stlp-run-detail-sections">
@@ -8130,10 +8741,11 @@ function buildPageHtml() {
     const settingsViewActive = isSettingsView();
     const waitingQueueViewActive = isWaitingQueueView();
     const dailySummaryViewActive = isDailySummaryView();
-    const monitorViewActive = !statusViewActive && !settingsViewActive && !waitingQueueViewActive && !dailySummaryViewActive;
+    const callTimerViewActive = isCallTimerView();
+    const monitorViewActive = !statusViewActive && !settingsViewActive && !waitingQueueViewActive && !dailySummaryViewActive && !callTimerViewActive;
     const pageSubtitle = statusViewActive
         ? "监控状态"
-        : (settingsViewActive ? "设置" : (waitingQueueViewActive ? "等待区" : (dailySummaryViewActive ? "日聚合" : "主监控页")));
+        : (settingsViewActive ? "设置" : (waitingQueueViewActive ? "等待区" : (dailySummaryViewActive ? "日聚合" : (callTimerViewActive ? "区间统计" : "主监控页"))));
 
     return `
         <div class="stlp-page-backdrop"${pageBackdropAction}></div>
@@ -8187,6 +8799,11 @@ function buildPageHtml() {
                             <svg class="stlp-icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19h16"/><path d="M7 15v-4"/><path d="M12 15V8"/><path d="M17 15v-6"/></svg>
                         </span>
                     </button>
+                    <button class="stlp-side-nav-item ${callTimerViewActive ? "is-active" : ""}" type="button" data-nav-action="open-call-timer" aria-pressed="${escapeHtml(String(callTimerViewActive))}" title="区间统计" aria-label="区间统计">
+                        <span class="stlp-side-nav-icon" aria-hidden="true">
+                            <svg class="stlp-icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3h4"/><path d="M12 14V9.5"/><path d="M18.5 7.5l1-1"/><circle cx="12" cy="14" r="7"/></svg>
+                        </span>
+                    </button>
                     <button class="stlp-side-nav-item ${settingsViewActive ? "is-active" : ""}" type="button" data-nav-action="open-settings" aria-pressed="${escapeHtml(String(settingsViewActive))}" title="设置" aria-label="设置">
                         <span class="stlp-side-nav-icon" aria-hidden="true">
                             <svg class="stlp-icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3h0a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8v0a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
@@ -8223,7 +8840,9 @@ function buildPageHtml() {
                                     ? `<div id="stlp_waiting_queue_view"></div>`
                                     : (dailySummaryViewActive
                                         ? `<div id="stlp_daily_summary_view"></div>`
-                                        : `<div id="stlp_monitor_sections" class="stlp-section-stack"></div>`)))}
+                                        : (callTimerViewActive
+                                            ? `<div id="stlp_call_timer_view"></div>`
+                                            : `<div id="stlp_monitor_sections" class="stlp-section-stack"></div>`))))}
                     </div>
                 </div>
             </div>
@@ -8304,6 +8923,7 @@ function renderPage() {
     const statusViewRoot = state.pageRoot.querySelector("#stlp_status_view");
     let waitingQueueViewRoot = state.pageRoot.querySelector("#stlp_waiting_queue_view");
     const dailySummaryViewRoot = state.pageRoot.querySelector("#stlp_daily_summary_view");
+    const callTimerViewRoot = state.pageRoot.querySelector("#stlp_call_timer_view");
     const monitorSectionsRoot = state.pageRoot.querySelector("#stlp_monitor_sections");
     const refreshButton = state.pageRoot.querySelector("#stlp_refresh_runs");
     const exportButton = state.pageRoot.querySelector("#stlp_export_runs");
@@ -8327,6 +8947,14 @@ function renderPage() {
     if (dailySummaryViewRoot) {
         dailySummaryViewRoot.innerHTML = buildDailySummaryViewHtml();
     }
+
+    if (callTimerViewRoot) {
+        callTimerViewRoot.innerHTML = buildCallTimerViewHtml();
+    }
+
+    // 每次重渲染后都要重挂：上面的 innerHTML 把带 data-call-timer-elapsed 的节点换掉了。
+    syncCallTimerTick();
+    syncCallTimerPoll();
 
     if (monitorSectionsRoot) {
         syncRunFloorMap();
@@ -8675,6 +9303,46 @@ function handlePanelAction(actionTarget, event) {
     const sectionKey = actionTarget.dataset.sectionKey || "";
     const insidePage = Boolean(actionTarget.closest("#stlp_page"));
     const insideHistoryDialog = Boolean(actionTarget.closest(".stlp-history-dialog"));
+
+    if (action === "start-call-timer") {
+        startCallTimer();
+        return true;
+    }
+
+    if (action === "stop-call-timer") {
+        stopCallTimer();
+        return true;
+    }
+
+    if (action === "refresh-call-timer") {
+        void loadCallTimerRuns();
+        return true;
+    }
+
+    if (action === "clear-call-timer") {
+        clearCallTimerWindow();
+        return true;
+    }
+
+    if (action === "view-call-timer-session") {
+        viewCallTimerSession(actionTarget.dataset.sessionId || "");
+        return true;
+    }
+
+    if (action === "toggle-call-timer-details") {
+        toggleCallTimerDetail(actionTarget.dataset.callTimerScope || "");
+        return true;
+    }
+
+    if (action === "save-call-timer-expected") {
+        saveCallTimerExpectedSources();
+        return true;
+    }
+
+    if (action === "clear-call-timer-expected") {
+        clearCallTimerExpectedSources();
+        return true;
+    }
 
     if (action === "legacy-lite-view-on" || action === "legacy-lite-view-off") {
         toggleLegacyLiteViewing(action === "legacy-lite-view-on");
@@ -9231,6 +9899,10 @@ function handlePanelClickTarget(target, event) {
             openDailySummarySection();
             return true;
         }
+        if (navActionTarget.dataset.navAction === "open-call-timer") {
+            openCallTimerSection();
+            return true;
+        }
         if (navActionTarget.dataset.navAction === "open-settings") {
             openSettingsSection();
             return true;
@@ -9314,6 +9986,10 @@ function bindRenderedPageActions() {
                 }
                 if (element.dataset.navAction === "open-daily-summary") {
                     openDailySummarySection();
+                    return;
+                }
+                if (element.dataset.navAction === "open-call-timer") {
+                    openCallTimerSection();
                     return;
                 }
                 if (element.dataset.navAction === "open-settings") {
