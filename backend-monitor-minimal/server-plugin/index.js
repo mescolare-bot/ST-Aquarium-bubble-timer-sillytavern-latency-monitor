@@ -13,12 +13,15 @@ import {
     updateMonitorSettings,
 } from '../settings-ui/service/monitor-settings-store.js';
 import {
+    UNKNOWN_PLUGIN_ID,
     createLearnedPluginRuleFromRun,
     matchLearnedPluginRuleAgainstRun,
     readPluginRuleByIdSync,
     readPluginRulesSync,
     removeLearnedPluginRule,
     setLearnedPluginRuleEnabled,
+    shouldApplyLearnedRuleToRun,
+    slugifyPluginId,
     upsertLearnedPluginRule,
 } from '../shared/plugin-rule-service.js';
 import {
@@ -29,7 +32,6 @@ import {
     filterRunsByChatKey,
     filterRunsByPurpose,
     normalizeOptionalText,
-    normalizeRequestPurpose,
     normalizeUsageValue,
     readRequestedFlag,
     toArchivedRunStub,
@@ -99,13 +101,8 @@ async function inspectInstalledPatches() {
 }
 
 
-function slugifyPluginId(value) {
-    const normalized = normalizeOptionalText(value)
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, '-')
-        .replace(/^-+|-+$/g, '');
-    return normalized || '';
-}
+// slugifyPluginId 从 shared/plugin-rule-service.js 引入：
+// 这里原本另有一份副本，两边一旦不同步，同一个拓展名在完整版和精简版会算出不同 id。
 
 
 function readRequestedPurpose(value) {
@@ -562,30 +559,8 @@ async function readWaitingQueueRuns() {
     }));
 }
 
-function shouldApplyLearnedRuleToRun(run, match) {
-    if (!run || !match?.pluginLabel) {
-        return false;
-    }
-
-    const normalizedPurpose = normalizeRequestPurpose(run.request_purpose);
-    const currentMatchMode = normalizeOptionalText(run.request_plugin_match_mode);
-    const currentPlugin = normalizeOptionalText(run.request_plugin);
-    const currentPluginLabel = normalizeOptionalText(run.request_plugin_label);
-
-    if (currentMatchMode === 'explicit' || currentMatchMode === 'fingerprint' || currentMatchMode === 'manual_waiting_queue') {
-        return false;
-    }
-
-    if (normalizedPurpose === 'non_chat_generation'
-        && currentPlugin
-        && currentPlugin !== 'unknown_plugin'
-        && currentPluginLabel
-        && currentPluginLabel !== match.pluginLabel) {
-        return false;
-    }
-
-    return true;
-}
+// shouldApplyLearnedRuleToRun 从 shared/plugin-rule-match.js 引入：
+// 精简版的回填也用它，改判口径必须两边一致。
 
 async function backfillRunsWithLearnedRule(rule, excludedRunId = '') {
     if (!rule) {
@@ -613,7 +588,7 @@ async function backfillRunsWithLearnedRule(rule, excludedRunId = '') {
             const updatedRun = {
                 ...run,
                 request_purpose: 'non_chat_generation',
-                request_plugin: match.pluginId || 'unknown_plugin',
+                request_plugin: match.pluginId || UNKNOWN_PLUGIN_ID,
                 request_plugin_label: match.pluginLabel,
                 request_plugin_match_mode: match.matchMode,
                 request_plugin_match_score: match.matchScore,
@@ -1083,7 +1058,7 @@ export async function init(router) {
             const updatedRun = await updateRunById(runId, (run) => ({
                 ...run,
                 request_purpose: 'non_chat_generation',
-                request_plugin: pluginId || 'unknown_plugin',
+                request_plugin: pluginId || UNKNOWN_PLUGIN_ID,
                 request_plugin_label: pluginLabel,
                 request_plugin_match_mode: 'manual_waiting_queue',
                 request_plugin_match_score: 1,

@@ -18,8 +18,20 @@ import {
     shouldReplaceCapturedUsage,
     summarizePrompt,
 } from '../backend-monitor-minimal/shared/run-analysis.js';
+import {
+    buildPromptMarkerSnapshot,
+    findMatchingPluginRuleForRun,
+} from '../backend-monitor-minimal/shared/plugin-rule-match.js';
 
 const RECORD_SOURCE = 'frontend';
+
+// 后端 resolveRequestPurpose 的口径：请求体里显式写了这三个值之一才算"自报"，
+// 自报的用途优先级高于规则推断出来的。
+const EXPLICIT_REQUEST_PURPOSES = new Set([
+    'chat_main_reply',
+    'non_chat_generation',
+    'plugin_internal_request',
+]);
 
 function nowMs() {
     return Date.now();
@@ -46,17 +58,58 @@ function createRunId() {
     return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function resolveExplicitMatchMode(requestBody) {
+    if (normalizeText(requestBody?.request_plugin)) {
+        return 'explicit';
+    }
+    return normalizeText(requestBody?.request_plugin_label) ? 'explicit_label_only' : 'none';
+}
+
+/**
+ * 已经自报了插件身份的请求不该被规则改判：自报的可信度最高，
+ * 规则推断只是给"没自报"的请求兜底。这和后端 resolveRequestPurpose 的优先级一致。
+ */
+function applyLearnedPluginRule(run, requestBody, learnedRules) {
+    if (run.request_plugin || run.request_plugin_label) {
+        return;
+    }
+
+    // run 里已经存好了 prompt_markers，match 会直接拿去用，不会再扫一遍正文。
+    const match = findMatchingPluginRuleForRun(learnedRules, run);
+    if (!match) {
+        return;
+    }
+
+    run.request_plugin = match.pluginId;
+    run.request_plugin_label = match.pluginLabel;
+    run.request_plugin_match_mode = match.matchMode;
+    run.request_plugin_match_score = match.matchScore;
+
+    if (!EXPLICIT_REQUEST_PURPOSES.has(requestBody?.request_purpose)) {
+        run.request_purpose = 'non_chat_generation';
+    }
+}
+
 /**
  * 请求发出的瞬间建记录。requestBody 是已经注入过元数据的那一份，
  * 所以 request_* 系列字段直接取用即可，不需要再算一遍。
  *
  * startedAtMs 必须由调用方在请求真正发出的那一刻取好再传进来：
  * 建记录之前可能要先等形态探测，用这里的当前时间会把等待时长算进耗时里。
+ *
+ * learnedRules 是等待区打标学出来的规则。传进来才能让"学一次、之后自动认"生效；
+ * 不传就退化成原来的行为，只是记录里多了 prompt 特征。
  */
-export function createLiteRun(requestBody, startedAtMs = nowMs()) {
+export function createLiteRun(requestBody, startedAtMs = nowMs(), learnedRules = []) {
     const promptBreakdown = summarizePrompt(requestBody?.messages);
+    // 特征必须在这一刻算：run 里不留原始 messages，事后再想补是补不回来的。
+    // 建规则和回填都读这两个字段。
+    const promptSnapshot = buildPromptMarkerSnapshot({
+        messages: requestBody?.messages,
+        promptTrace: requestBody?.prompt_trace,
+    });
 
-    return {
+    const run = {
         id: createRunId(),
         record_source: RECORD_SOURCE,
         started_at_iso: new Date(startedAtMs).toISOString(),
@@ -65,6 +118,10 @@ export function createLiteRun(requestBody, startedAtMs = nowMs()) {
         request_purpose: normalizeText(requestBody?.request_purpose) ?? 'chat_main_reply',
         request_plugin: normalizeText(requestBody?.request_plugin),
         request_plugin_label: normalizeText(requestBody?.request_plugin_label),
+        // 和后端 inferPluginFromRequest 同口径：报了 id 算显式上报，
+        // 只报了名字没报 id 也是自报，单列一档，别混成"没识别"。
+        request_plugin_match_mode: resolveExplicitMatchMode(requestBody),
+        request_plugin_match_score: 0,
         request_injection_source: normalizeText(requestBody?.request_injection_source),
         request_injection_source_label: normalizeText(requestBody?.request_injection_source_label),
         request_chat_key: normalizeText(requestBody?.request_chat_key),
@@ -82,6 +139,9 @@ export function createLiteRun(requestBody, startedAtMs = nowMs()) {
         message_count: Array.isArray(requestBody?.messages) ? requestBody.messages.length : null,
         prompt_chars: safeStringifyLength(requestBody?.messages),
         prompt_breakdown: promptBreakdown,
+        // 每项最多 12 条、每条至多 80 字符，对 IndexedDB 的占用可以忽略。
+        prompt_markers: promptSnapshot.promptMarkers,
+        prompt_trace_keys: promptSnapshot.promptTraceKeys,
 
         // 浏览器侧同样有四个观测点，只是"发给上游"这一点观测不到，
         // 用"请求发出"顶上——对 detectFailedStage 而言语义是等价的。
@@ -111,6 +171,10 @@ export function createLiteRun(requestBody, startedAtMs = nowMs()) {
         outcome: null,
         abnormal_detail: null,
     };
+
+    applyLearnedPluginRule(run, requestBody, learnedRules);
+
+    return run;
 }
 
 /** fetch 的 promise resolve 就意味着响应头到了，这是浏览器能观测到的第二个点。 */
