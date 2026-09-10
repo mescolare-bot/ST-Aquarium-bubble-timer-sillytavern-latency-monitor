@@ -3144,6 +3144,315 @@ body.stlp-page-host-open {
     opacity: 1;
 }
 
+.stlp-call-timer-view {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    color: var(--stlp-panel-text);
+    font-size: var(--stlp-font-body);
+}
+
+.stlp-call-timer-control {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 14px;
+    border: 1px solid var(--stlp-border-soft);
+    border-radius: 12px;
+    background: var(--stlp-surface-1);
+}
+
+.stlp-call-timer-elapsed {
+    font-size: calc(var(--stlp-font-title) + 0.35rem);
+    font-weight: 700;
+    line-height: 1.2;
+    /* 秒数每秒都在变，等宽才不会让整行左右跳动 */
+    font-variant-numeric: tabular-nums;
+}
+
+.stlp-call-timer-range {
+    margin-top: 4px;
+    font-size: var(--stlp-font-body);
+    opacity: 0.85;
+}
+
+.stlp-call-timer-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+/* .stlp-inline-button 自带 margin-left:auto，那是留给"一行只有一个按钮、顶到最右"的场景。
+   成组出现时每个按钮都拿 auto margin 去抢剩余空间，一行就被撑得参差不齐；
+   酒馆 .menu_button 自带的 margin:5px 0 还会在换行后额外加宽行距。这几处一律复位，
+   间距全部交给容器的 gap。 */
+.stlp-call-timer-buttons .stlp-inline-button,
+.stlp-call-timer-sessions .stlp-inline-button,
+.stlp-call-timer-history-detail-header .stlp-inline-button {
+    margin: 0;
+}
+
+.stlp-call-timer-warning {
+    padding: 10px 12px;
+    border: 1px solid var(--stlp-border-soft);
+    border-radius: 10px;
+    background: color-mix(in srgb, var(--stlp-surface-1) 70%, var(--stlp-panel-bg-strong));
+    line-height: 1.6;
+}
+
+.stlp-call-timer-groups {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-top: 10px;
+}
+
+.stlp-call-timer-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    border: 1px solid var(--stlp-border-soft);
+    border-radius: 999px;
+    background: var(--stlp-surface-1);
+}
+
+.stlp-call-timer-group-label {
+    font-weight: 700;
+}
+
+.stlp-call-timer-section {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+/* 本次区间和历史区间是两套互不相干的统计，各占一张卡。
+   不圈起来的话两者会连成一片，看着像同一份数据的上下文。 */
+.stlp-call-timer-card {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 14px;
+    border: 1px solid var(--stlp-border-soft);
+    border-radius: 12px;
+    background: var(--stlp-surface-1);
+}
+
+.stlp-call-timer-card-title {
+    font-size: calc(var(--stlp-font-title) + 0.04rem);
+    font-weight: 700;
+    line-height: 1.4;
+}
+
+/* 控制条自己带一层边框和 surface-1 背景，套进同色卡片就成了"框中框"。
+   在卡片里改用嵌套色，让它读作卡内的一块读数面板。 */
+.stlp-call-timer-card > .stlp-call-timer-control {
+    background: color-mix(in srgb, var(--stlp-surface-1) 60%, var(--stlp-panel-bg-strong));
+}
+
+/* 拉条和表格要拼成一整块，中间不能有间距，所以这里不用 stlp-call-timer-section。 */
+.stlp-call-timer-details {
+    display: flex;
+    flex-direction: column;
+    margin-top: 6px;
+}
+
+/* 容器故意没有 gap，末尾那条截断说明得自己撑开。 */
+.stlp-call-timer-details > .stlp-note {
+    margin-top: 6px;
+}
+
+/* 明细默认收起，只留这一条可点的横栏。 */
+.stlp-call-timer-detail-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    width: 100%;
+    padding: 8px 12px;
+    border: 1px solid var(--stlp-border-soft);
+    border-radius: 10px;
+    background: color-mix(in srgb, var(--stlp-surface-1) 70%, var(--stlp-panel-bg-strong));
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.stlp-call-timer-detail-bar:hover {
+    border-color: var(--stlp-accent, var(--stlp-border-soft));
+}
+
+.stlp-call-timer-detail-bar.is-expanded {
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+}
+
+.stlp-call-timer-detail-bar-label {
+    font-weight: 700;
+}
+
+.stlp-call-timer-detail-bar-icon {
+    display: inline-flex;
+    align-items: center;
+    transition: transform 0.15s ease;
+}
+
+.stlp-call-timer-detail-bar-icon.is-expanded {
+    transform: rotate(180deg);
+}
+
+.stlp-call-timer-detail-bar.is-expanded + .stlp-call-timer-table {
+    border-top: 0;
+    border-top-left-radius: 0;
+    border-top-right-radius: 0;
+}
+
+/* 展开的那一段历史区间，再往里缩一层，跟上面那排段落按钮分开。 */
+.stlp-call-timer-history-detail {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 4px;
+    padding: 12px;
+    border: 1px solid var(--stlp-border-soft);
+    border-radius: 10px;
+    background: color-mix(in srgb, var(--stlp-surface-1) 60%, var(--stlp-panel-bg-strong));
+}
+
+.stlp-call-timer-history-detail-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.stlp-call-timer-history-detail-range {
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+}
+
+.stlp-call-timer-missing {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.stlp-call-timer-table {
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--stlp-border-soft);
+    border-radius: 12px;
+    background: var(--stlp-surface-1);
+    overflow: hidden;
+}
+
+.stlp-call-timer-row {
+    display: grid;
+    grid-template-columns: 5.5rem 8rem minmax(6rem, 1fr) minmax(6rem, 1fr) 4.5rem 1.75rem;
+    gap: 10px;
+    padding: 10px 12px;
+    align-items: center;
+}
+
+/* 展开的卡片会插在两行之间，光靠相邻选择器会漏掉卡片后面那一行的分隔线。 */
+.stlp-call-timer-row + .stlp-call-timer-row,
+.stlp-call-timer-detail-card + .stlp-call-timer-row,
+.stlp-call-timer-row.is-expanded + .stlp-call-timer-detail-card {
+    border-top: 1px solid var(--stlp-border-soft);
+}
+
+.stlp-call-timer-row.is-expanded {
+    background: color-mix(in srgb, var(--stlp-surface-1) 60%, var(--stlp-panel-bg-strong));
+}
+
+.stlp-call-timer-cell-expand {
+    display: flex;
+    justify-content: flex-end;
+}
+
+.stlp-call-timer-expand-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2px;
+    min-width: 0;
+    line-height: 0;
+    background: none;
+    border: none;
+    opacity: 0.75;
+    transition: transform 0.15s ease, opacity 0.15s ease;
+}
+
+.stlp-call-timer-expand-button:hover {
+    opacity: 1;
+}
+
+.stlp-call-timer-expand-button.is-expanded {
+    transform: rotate(180deg);
+}
+
+.stlp-call-timer-detail-card {
+    padding: 4px 12px 12px;
+    background: color-mix(in srgb, var(--stlp-surface-1) 60%, var(--stlp-panel-bg-strong));
+}
+
+.stlp-call-timer-row-head {
+    font-weight: 700;
+    background: color-mix(in srgb, var(--stlp-surface-1) 70%, var(--stlp-panel-bg-strong));
+}
+
+.stlp-call-timer-cell {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.stlp-call-timer-cell-time,
+.stlp-call-timer-cell-duration {
+    font-variant-numeric: tabular-nums;
+}
+
+.stlp-call-timer-sessions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.stlp-call-timer-sessions .menu_button.is-active {
+    border-color: var(--stlp-accent, currentColor);
+}
+
+/* 窄屏一行放不下五列，改成上下堆叠，标题行就没意义了 */
+.stlp-page-host.stlp-layout-mobile .stlp-call-timer-row {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+
+.stlp-page-host.stlp-layout-mobile .stlp-call-timer-row-head {
+    display: none;
+}
+
+.stlp-page-host.stlp-layout-mobile .stlp-call-timer-cell-source,
+.stlp-page-host.stlp-layout-mobile .stlp-call-timer-cell-model {
+    grid-column: 1 / -1;
+}
+
+/* 窄屏上那个小箭头太难点了，铺成整行一条，命中面积够大。 */
+.stlp-page-host.stlp-layout-mobile .stlp-call-timer-cell-expand {
+    grid-column: 1 / -1;
+    justify-content: stretch;
+}
+
+.stlp-page-host.stlp-layout-mobile .stlp-call-timer-expand-button {
+    width: 100%;
+    padding: 6px 0;
+    border: 1px solid var(--stlp-border-soft);
+    border-radius: 8px;
+}
+
 .stlp-suggestion-list {
     margin: 8px 0 0;
     padding-left: 20px;
