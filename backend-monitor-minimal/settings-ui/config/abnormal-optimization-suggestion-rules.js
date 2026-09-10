@@ -155,7 +155,11 @@ export const abnormalOptimizationFailedGenerationTypes = [
     'suspected_incomplete_generation',
 ];
 
-// 用户自己按的停止不是故障，记录保留下来方便回溯，但没有任何"该怎么办"可给。
+// 这里的类型只标出来，不给建议。
+// client_stopped：用户自己按的停止，不是故障，没有任何"该怎么办"可给。
+// empty_response：接口正常返回但正文为空，成因目前没有实据，
+//   与其编一句听着像那么回事的话，不如只如实告诉用户这次回复是空的。
 export const abnormalOptimizationSuppressedTypes = [
     'client_stopped',
+    'empty_response',
 ];

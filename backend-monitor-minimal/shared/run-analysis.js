@@ -164,8 +164,39 @@ export function summarizePrompt(messages) {
     return null;
 }
 
+// output_chars 是正文长度，output_bytes 只是收到的传输字节数——非流式时它把 JSON 信封
+// 一起算了进去，正文为空的响应照样有几百字节。原来两者取"或"，字节数永远先为真，
+// 于是空回复被判成"有正文"。有正文长度就以它为准，只有更早版本没记这个数时才退回字节数。
 export function hasRecordedOutput(run) {
-    return run.output_bytes > 0 || (typeof run.output_chars === 'number' && run.output_chars > 0);
+    if (typeof run?.output_chars === 'number' && Number.isFinite(run.output_chars)) {
+        return run.output_chars > 0;
+    }
+
+    return Number(run?.output_bytes) > 0;
+}
+
+// 同时认三种响应形状：流式的 choice.delta、非流式的 choice.message、老式补全的 choice.text。
+export function extractResponseText(payload) {
+    const choices = Array.isArray(payload?.choices) ? payload.choices : [];
+    let text = '';
+
+    for (const choice of choices) {
+        const delta = choice?.delta ?? choice?.message ?? null;
+        if (typeof delta?.content === 'string') {
+            text += delta.content;
+        } else if (Array.isArray(delta?.content)) {
+            for (const part of delta.content) {
+                if (typeof part?.text === 'string') {
+                    text += part.text;
+                }
+            }
+        }
+        if (typeof choice?.text === 'string') {
+            text += choice.text;
+        }
+    }
+
+    return text;
 }
 
 export function detectFailedStage(run) {
@@ -210,8 +241,11 @@ export function detectAbnormalType(run) {
     const isTimeout = /timeout|timed out|time out/.test(errorText);
     const isStreamInterrupted = Boolean(run.stream && phases.first_chunk_received && !phases.stream_completed);
     const isSuspectedIncompleteGeneration = Boolean(run.stream && hasOutput && !phases.stream_completed && !hasError);
+    // 接口一切正常地返回了，但一个字正文都没有。和"未输出即失败"不是一回事：
+    // 那一类有明确的报错可查，这一类没有任何错误信号，光看状态码完全像成功。
+    const isEmptyResponse = !hasError && !hasOutput;
 
-    if (!hasError && !isSuspectedIncompleteGeneration && !isStreamInterrupted) {
+    if (!hasError && !isEmptyResponse && !isSuspectedIncompleteGeneration && !isStreamInterrupted) {
         return null;
     }
 
@@ -231,6 +265,11 @@ export function detectAbnormalType(run) {
 
     if (isSuspectedIncompleteGeneration) {
         return 'suspected_incomplete_generation';
+    }
+
+    // 排在 failed_without_output 之前不会抢它：那一类要求 hasError，和这里互斥。
+    if (isEmptyResponse) {
+        return 'empty_response';
     }
 
     if (hasError && !hasOutput) {
@@ -906,6 +945,12 @@ export function processSseUsageEvent(run, eventBlock) {
         }
         if (completionReason) {
             run.response_finish_reason = completionReason;
+        }
+        // 正文长度也在这里攒：流式只有逐帧累加才知道最后一共出了多少字，
+        // 而这是判断"这次回复是不是空的"唯一可靠的依据。
+        const text = extractResponseText(payload);
+        if (text) {
+            run.output_chars = (typeof run.output_chars === 'number' ? run.output_chars : 0) + text.length;
         }
     } catch {
         // Ignore non-JSON SSE frames.
