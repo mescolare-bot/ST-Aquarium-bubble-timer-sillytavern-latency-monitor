@@ -12,6 +12,7 @@ import {
     buildAbnormalDetail,
     buildResponseCompletionReasonFromPayload,
     buildResponseUsageFromPayload,
+    extractResponseText,
     findSseEventBoundary,
     processSseUsageEvent,
     safeStringifyLength,
@@ -183,29 +184,6 @@ export function markLiteResponseHeaders(run, response) {
     run.http_status = normalizeNumber(response?.status);
 }
 
-function extractDeltaText(payload) {
-    const choices = Array.isArray(payload?.choices) ? payload.choices : [];
-    let text = '';
-
-    for (const choice of choices) {
-        const delta = choice?.delta ?? choice?.message ?? null;
-        if (typeof delta?.content === 'string') {
-            text += delta.content;
-        } else if (Array.isArray(delta?.content)) {
-            for (const part of delta.content) {
-                if (typeof part?.text === 'string') {
-                    text += part.text;
-                }
-            }
-        }
-        if (typeof choice?.text === 'string') {
-            text += choice.text;
-        }
-    }
-
-    return text;
-}
-
 async function consumeStreaming(run, body) {
     const reader = body.getReader();
     const decoder = new TextDecoder();
@@ -233,22 +211,8 @@ async function consumeStreaming(run, body) {
                 const block = buffer.slice(0, boundary.index);
                 buffer = buffer.slice(boundary.index + boundary.length);
 
+                // usage 和正文长度都由它一并攒起来，这里不要再自己数一遍，会翻倍。
                 processSseUsageEvent(run, block);
-
-                for (const line of block.split(/\r?\n/)) {
-                    if (!line.startsWith('data:')) {
-                        continue;
-                    }
-                    const payloadText = line.slice(5).trim();
-                    if (!payloadText || payloadText === '[DONE]') {
-                        continue;
-                    }
-                    try {
-                        run.output_chars += extractDeltaText(JSON.parse(payloadText)).length;
-                    } catch {
-                        // 非 JSON 帧忽略，和后端的处理一致。
-                    }
-                }
 
                 boundary = findSseEventBoundary(buffer);
             }
@@ -284,7 +248,7 @@ async function consumeJson(run, response) {
         if (completionReason) {
             run.response_finish_reason = completionReason;
         }
-        run.output_chars = extractDeltaText(payload).length;
+        run.output_chars = extractResponseText(payload).length;
     } catch {
         // 酒馆报错时返回的可能不是 JSON，把原文当作错误信息留下。
         run.error = text.slice(0, 500) || null;
@@ -338,10 +302,8 @@ export function finalizeLiteRun(run, settings) {
         run.outcome = run.stream ? 'stream' : 'json';
     }
 
-    if (run.output_chars === 0) {
-        run.output_chars = null;
-    }
-
+    // 这里原本把 0 抹成 null。抹掉之后"正文一个字都没有"就和"更早版本没记这个数"
+    // 变成了同一种表现，空回复因此永远查不出来。0 是结论，必须留着。
     run.abnormal_detail = buildAbnormalDetail(run, settings);
     return run;
 }

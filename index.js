@@ -238,6 +238,7 @@ const ABNORMAL_TYPE_LABELS = {
     request_timeout: "请求超时",
     stream_interrupted: "流式中断",
     suspected_incomplete_generation: "疑似未完整生成",
+    empty_response: "回复是空的",
 };
 
 const ABNORMAL_BILLING_STATUS_LABELS = {
@@ -3697,11 +3698,15 @@ function getRunCompletionReasonLabel(run) {
     return COMPLETION_REASON_LABELS[value] || value;
 }
 
+// 和 shared/run-analysis.js 里的 hasRecordedOutput 必须同口径：
+// 正文长度说了算，字节数只是老记录没有正文长度时的退路。
 function hasRunRecordedOutput(run) {
+    if (typeof run?.output_chars === "number" && Number.isFinite(run.output_chars)) {
+        return run.output_chars > 0;
+    }
+
     const outputBytes = Number(run?.output_bytes);
-    const outputChars = Number(run?.output_chars);
-    return (Number.isFinite(outputBytes) && outputBytes > 0)
-        || (Number.isFinite(outputChars) && outputChars > 0);
+    return Number.isFinite(outputBytes) && outputBytes > 0;
 }
 
 function hasRunFirstOutputSignal(run) {
@@ -3797,6 +3802,12 @@ function getRunFailureEvidenceSummary(run, abnormalType, failedStage, abnormalBi
 
     if (abnormalType === "client_disconnected") {
         return hasUsageEvidence ? "浏览器和酒馆之间断开了连接，且已发生计费" : "浏览器和酒馆之间断开了连接";
+    }
+
+    // 成因说不准，但事实是确定的：状态码正常、没有任何报错，正文却一个字都没有。
+    // 所以这里用陈述句，不用"更像"，也不往下猜是谁的问题。
+    if (abnormalType === "empty_response") {
+        return hasUsageEvidence ? "接口正常返回，但没有任何正文，且已发生计费" : "接口正常返回，但没有任何正文";
     }
 
     if (abnormalType === "request_timeout") {

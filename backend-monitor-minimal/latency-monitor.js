@@ -17,6 +17,7 @@ import {
     buildResponseUsageFromPayload,
     detectAbnormalType,
     detectFailedStage,
+    extractResponseText,
     findSseEventBoundary,
     hasRecordedOutput,
     isClientAbortError,
@@ -427,7 +428,9 @@ export function createGenerationMonitor(request) {
         response_usage: null,
         response_finish_reason: null,
         output_bytes: 0,
-        output_chars: null,
+        // 从 0 起步而不是 null：null 的含义是"这个版本没记正文长度"，判定会退回去看字节数。
+        // 一次真的什么正文都没出的生成，结论就是 0，不能和"没记"混为一谈。
+        output_chars: 0,
         error: null,
         client_stopped: false,
     };
@@ -447,7 +450,9 @@ export function createGenerationMonitor(request) {
     }
 
     function captureJson(json) {
-        run.output_chars = safeStringifyLength(json);
+        // 原来记的是整份 JSON 序列化后的长度，也就是连信封一起算。那个数永远大于 0，
+        // 正文为空时照样"有输出"，空回复因此完全查不出来。这里只数真正的正文。
+        run.output_chars = extractResponseText(json).length;
         const usage = buildResponseUsageFromPayload(json);
         const completionReason = buildResponseCompletionReasonFromPayload(json);
         if (shouldReplaceCapturedUsage(run.response_usage, usage)) {
