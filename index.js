@@ -8646,9 +8646,10 @@ function buildCloseConfirmHtml() {
         ];
     } else if (state.confirmDialog.type === "manual-force-stop-generation") {
         title = "强行终止当前生成？";
+        // "尽量"两个字不能去掉：终止不保证成功，实测有过指令发出去、生成仍然跑完的例子。
         text = state.confirmDialog.mode === "rescue"
-            ? "现在没有检测到明确的活跃生成信号，但你遇到的那种“酒馆停止键消失、发送键也没回来”的死锁，确实可能把检测链路一起骗过去。继续后会补做一次酒馆原生终止探测；如果还卡住，再补发中止指令，尽量把前端锁松开。"
-            : "会先尝试酒馆原生停止；如果还卡住，会继续强制切断监控接管的请求，并再补一次 Escape，尽量把前端锁一起松开。";
+            ? "现在没检测到正在进行的生成。如果你的发送键卡住点不动，可以继续试着恢复它。"
+            : "停掉正在进行的这次生成，并尽量让发送按钮恢复可用。";
         actions = [
             { action: "confirm-manual-force-stop-yes", label: "是" },
             { action: "confirm-manual-force-stop-no", label: "否" },
