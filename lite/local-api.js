@@ -17,6 +17,15 @@ import {
     readRequestedFlag,
     toClientRuns,
 } from '../backend-monitor-minimal/shared/run-query.js';
+import {
+    UNKNOWN_PLUGIN_ID,
+    createLearnedPluginRuleFromRun,
+    matchLearnedPluginRuleAgainstRun,
+    mergeLearnedPluginRule,
+    normalizeRuleList,
+    shouldApplyLearnedRuleToRun,
+    slugifyPluginId,
+} from '../backend-monitor-minimal/shared/plugin-rule-match.js';
 import { cloneMonitorSettingsDefaults } from '../backend-monitor-minimal/settings-ui/config/monitor-settings-default.js';
 import {
     inferPermissionLevelFromHost,
@@ -37,6 +46,7 @@ import {
 const MAX_RUNS_PAGE_LIMIT = 2000;
 const SETTINGS_META_KEY = 'settings';
 const WAITING_QUEUE_META_KEY = 'waiting-queue';
+const PLUGIN_RULES_META_KEY = 'plugin-rules';
 
 // 和后端 readRequestedPurpose 保持一致：只认这三个值，其余按"不筛选"处理。
 function readRequestedPurpose(value) {
@@ -50,11 +60,96 @@ function readRequestedChatKey(value) {
     return normalizeOptionalText(value, 200) || '';
 }
 
-function slugifyPluginId(value) {
-    return normalizeOptionalText(value)
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, '-')
-        .replace(/^-+|-+$/g, '');
+// slugifyPluginId 从 plugin-rule-match.js 引入，和后端同一份实现。
+
+export async function readLitePluginRules() {
+    return normalizeRuleList(await readMeta(PLUGIN_RULES_META_KEY, []));
+}
+
+async function writeLitePluginRules(rules) {
+    const normalized = normalizeRuleList(rules);
+    await writeMeta(PLUGIN_RULES_META_KEY, normalized);
+    return normalized;
+}
+
+/**
+ * 把一条规则套到已有记录上，命中的就地改判。
+ * 和后端 backfillRunsWithLearnedRule 同义：打标之后，之前那些没认出来的同类记录也一起改。
+ */
+async function backfillLiteRunsWithRule(rule, excludedRunId = '') {
+    if (!rule) {
+        return { updatedCount: 0, updatedRunIds: [] };
+    }
+
+    const runs = await readAllRuns();
+    const updatedRunIds = [];
+
+    for (const run of runs) {
+        if (!run || run.id === excludedRunId) {
+            continue;
+        }
+
+        const match = matchLearnedPluginRuleAgainstRun(rule, run);
+        if (!match || match.ruleId !== rule.id || !shouldApplyLearnedRuleToRun(run, match)) {
+            continue;
+        }
+
+        await updateRunById(run.id, (existing) => ({
+            ...existing,
+            request_purpose: 'non_chat_generation',
+            request_plugin: match.pluginId || UNKNOWN_PLUGIN_ID,
+            request_plugin_label: match.pluginLabel,
+            request_plugin_match_mode: match.matchMode,
+            request_plugin_match_score: match.matchScore,
+        }));
+        updatedRunIds.push(run.id);
+    }
+
+    return { updatedCount: updatedRunIds.length, updatedRunIds };
+}
+
+/**
+ * 给每条规则补上"命中多少条、已生效多少条、还能改判多少条"，字段名和后端
+ * buildPluginRuleSummaries 对齐，面板的渲染代码两种形态共用。
+ */
+async function buildLitePluginRuleSummaries() {
+    const rules = await readLitePluginRules();
+    const runs = await readAllRuns();
+
+    return rules.map((rule) => {
+        let matchedRuns = 0;
+        let activeRuns = 0;
+        let pendingRuns = 0;
+
+        for (const run of runs) {
+            const match = matchLearnedPluginRuleAgainstRun(rule, run);
+            if (!match || match.ruleId !== rule.id) {
+                continue;
+            }
+
+            matchedRuns += 1;
+            if (run.request_plugin_match_mode === 'learned_rule'
+                && normalizeOptionalText(run.request_plugin_label) === rule.plugin_label
+                && normalizeOptionalText(run.request_plugin) === rule.plugin_id) {
+                activeRuns += 1;
+            }
+            if (shouldApplyLearnedRuleToRun(run, match)) {
+                pendingRuns += 1;
+            }
+        }
+
+        return {
+            ...rule,
+            matched_runs: matchedRuns,
+            active_runs: activeRuns,
+            pending_runs: pendingRuns,
+            sample_count: Number(rule.sample_count) || (Array.isArray(rule.sample_run_ids) ? rule.sample_run_ids.length : 0),
+        };
+    }).sort((left, right) => {
+        const leftUpdated = left.updated_at ? Date.parse(left.updated_at) : 0;
+        const rightUpdated = right.updated_at ? Date.parse(right.updated_at) : 0;
+        return rightUpdated - leftUpdated;
+    });
 }
 
 export async function readLiteSettings() {
@@ -82,14 +177,35 @@ function resolveLitePermissionLevel(settings) {
     return resolvePermissionLevel(settings, inferred);
 }
 
-async function readWaitingQueueIds() {
+// 条目结构和完整版的 waiting-queue.json 保持一致，面板读的是 entry.run_id / entry.created_at。
+async function readWaitingQueueEntries() {
     const stored = await readMeta(WAITING_QUEUE_META_KEY, []);
-    return Array.isArray(stored) ? stored : [];
+    if (!Array.isArray(stored)) {
+        return [];
+    }
+
+    const entries = [];
+    for (const item of stored) {
+        // 早期版本这里只存了一个 id 数组，加入时间当时就没记，补不出来，留空。
+        const source = typeof item === 'string' ? { run_id: item } : item;
+        const runId = normalizeOptionalText(source?.run_id);
+        if (!runId) {
+            continue;
+        }
+        entries.push({
+            run_id: runId,
+            created_at: normalizeOptionalText(source?.created_at) || '',
+            status: normalizeOptionalText(source?.status) || 'pending',
+            plugin_label: normalizeOptionalText(source?.plugin_label) || '',
+            plugin_id: normalizeOptionalText(source?.plugin_id) || '',
+        });
+    }
+    return entries;
 }
 
-async function writeWaitingQueueIds(ids) {
-    await writeMeta(WAITING_QUEUE_META_KEY, ids);
-    return ids;
+async function writeWaitingQueueEntries(entries) {
+    await writeMeta(WAITING_QUEUE_META_KEY, entries);
+    return entries;
 }
 
 function parseTarget(rawPath) {
@@ -208,13 +324,9 @@ async function handleStatus() {
 }
 
 async function handleWaitingQueue() {
-    const ids = await readWaitingQueueIds();
     const entries = [];
-    for (const id of ids) {
-        const run = await readRunById(id);
-        if (run) {
-            entries.push(run);
-        }
+    for (const entry of await readWaitingQueueEntries()) {
+        entries.push({ ...entry, run: (await readRunById(entry.run_id)) ?? null });
     }
     return { ok: true, count: entries.length, entries };
 }
@@ -229,7 +341,7 @@ async function handleWaitingQueueLabel(runId, body) {
     const updated = await updateRunById(runId, (run) => ({
         ...run,
         request_purpose: 'non_chat_generation',
-        request_plugin: pluginId || 'unknown_plugin',
+        request_plugin: pluginId || UNKNOWN_PLUGIN_ID,
         request_plugin_label: pluginLabel,
         request_plugin_match_mode: 'manual_waiting_queue',
         request_plugin_match_score: 1,
@@ -239,12 +351,33 @@ async function handleWaitingQueueLabel(runId, body) {
         throw new Error('Run not found.');
     }
 
-    const ids = await readWaitingQueueIds();
-    await writeWaitingQueueIds(ids.filter((id) => id !== runId));
+    const queued = await readWaitingQueueEntries();
+    await writeWaitingQueueEntries(queued.filter((entry) => entry.run_id !== runId));
 
-    // 后端在这里还会把标注学成一条插件规则，用来给之后没标注的请求兜底。
-    // 精简模式没有规则库，所以只改这一条记录，rule 显式给 null。
-    return { ok: true, run: updated, rule: null };
+    // 和后端同一套动作：把这次标注学成规则，再拿它去改判已有的同类记录。
+    // 规则存 IndexedDB 的 meta，匹配逻辑和后端共用 plugin-rule-match.js。
+    const learnedRule = createLearnedPluginRuleFromRun(updated, pluginLabel, pluginId, runId);
+    let savedRule = null;
+    let backfill = { updatedCount: 0, updatedRunIds: [] };
+
+    if (learnedRule) {
+        const merged = mergeLearnedPluginRule(await readLitePluginRules(), learnedRule);
+        if (merged.rule) {
+            await writeLitePluginRules(merged.rules);
+            savedRule = merged.rule;
+            backfill = await backfillLiteRunsWithRule(savedRule, runId);
+        }
+    }
+
+    return {
+        ok: true,
+        run: updated,
+        // 老记录没有 prompt 特征（那是这个版本才开始存的），学不出规则，
+        // 这里就会是 null。如实返回，不要让面板以为规则已经建好了。
+        rule: savedRule,
+        backfilled_runs: backfill.updatedCount,
+        backfilled_run_ids: backfill.updatedRunIds,
+    };
 }
 
 /**
@@ -303,11 +436,26 @@ export async function handleLocalRequest(rawPath, options = {}) {
             if (!runId) {
                 throw new Error('run_id is required.');
             }
-            const ids = await readWaitingQueueIds();
-            if (!ids.includes(runId)) {
-                await writeWaitingQueueIds([...ids, runId]);
+            // 和完整版一致：记录不存在就拒绝，别往队列里塞一个指不到记录的条目。
+            if (!(await readRunById(runId))) {
+                throw new Error('Run not found.');
             }
-            return { ok: true, entry: await readRunById(runId) };
+
+            const entries = await readWaitingQueueEntries();
+            const existing = entries.find((entry) => entry.run_id === runId);
+            if (existing) {
+                return { ok: true, entry: existing };
+            }
+
+            const nextEntry = {
+                run_id: runId,
+                created_at: new Date().toISOString(),
+                status: 'pending',
+                plugin_label: '',
+                plugin_id: '',
+            };
+            await writeWaitingQueueEntries([nextEntry, ...entries]);
+            return { ok: true, entry: nextEntry };
         }
         return handleWaitingQueue();
     }
@@ -319,16 +467,66 @@ export async function handleLocalRequest(rawPath, options = {}) {
             return handleWaitingQueueLabel(runId, body);
         }
         const runId = decodeURIComponent(rest);
-        const ids = await readWaitingQueueIds();
-        const removed = ids.includes(runId);
-        await writeWaitingQueueIds(ids.filter((id) => id !== runId));
+        const entries = await readWaitingQueueEntries();
+        const nextEntries = entries.filter((entry) => entry.run_id !== runId);
+        const removed = nextEntries.length !== entries.length;
+        if (removed) {
+            await writeWaitingQueueEntries(nextEntries);
+        }
         return { ok: true, removed, run_id: runId };
     }
 
-    // 插件规则依赖服务端的哈希与规则学习，精简模式没有。显式说明而不是返回空数组，
-    // 否则面板会表现得像"一条规则都没学到"，让人以为是功能坏了。
-    if (pathname.startsWith('/plugin-rules')) {
-        return { ok: true, supported: false, rules: [], reason: 'lite_mode_backend_required' };
+    // 规则的匹配算法是纯逻辑，和后端共用 plugin-rule-match.js；
+    // 差别只在存哪儿——后端是 plugin-rules.json，这里是 IndexedDB 的 meta。
+    if (pathname === '/plugin-rules') {
+        const rules = await buildLitePluginRuleSummaries();
+        return { ok: true, count: rules.length, rules };
+    }
+
+    if (pathname.startsWith('/plugin-rules/')) {
+        const rest = pathname.slice('/plugin-rules/'.length);
+
+        if (rest.endsWith('/reapply')) {
+            const ruleId = decodeURIComponent(rest.slice(0, -'/reapply'.length));
+            const rule = (await readLitePluginRules()).find((item) => item.id === ruleId) ?? null;
+            if (!rule) {
+                throw new Error('Rule not found.');
+            }
+
+            const backfill = await backfillLiteRunsWithRule(rule);
+            return {
+                ok: true,
+                rule,
+                matched_runs: backfill.updatedCount,
+                matched_run_ids: backfill.updatedRunIds,
+            };
+        }
+
+        const ruleId = decodeURIComponent(rest);
+        const rules = await readLitePluginRules();
+        const index = rules.findIndex((item) => item.id === ruleId);
+        if (index < 0) {
+            throw new Error('Rule not found.');
+        }
+
+        if (method === 'DELETE') {
+            const removed = rules[index];
+            await writeLitePluginRules(rules.filter((item) => item.id !== ruleId));
+            return { ok: true, removed: true, rule: removed };
+        }
+
+        if (method === 'PATCH') {
+            const nextRules = [...rules];
+            nextRules[index] = {
+                ...nextRules[index],
+                enabled: body?.enabled !== false,
+                updated_at: new Date().toISOString(),
+            };
+            const saved = await writeLitePluginRules(nextRules);
+            return { ok: true, rule: saved.find((item) => item.id === ruleId) ?? nextRules[index] };
+        }
+
+        return { ok: true, rule: rules[index] };
     }
 
     // 精简模式下前端自己就知道是不是用户按的停止，不需要给后端发信号。

@@ -5886,7 +5886,10 @@ function recordLiteGeneration(effectiveInit, responsePromise) {
             }
 
             const { api, store, recorder } = await loadLiteModules();
-            run = recorder.createLiteRun(requestBody, startedAtMs);
+            // 规则是等待区打标学出来的，拿它给这次请求兜底认领拓展身份。
+            // 读不出来（比如库刚建）不该拖累记录本身，所以失败就当没有规则。
+            const learnedRules = await api.readLitePluginRules().catch(() => []);
+            run = recorder.createLiteRun(requestBody, startedAtMs, learnedRules);
             // 拿不到 token 时面板要说明成因，而成因只有请求发出的那一刻才知道
             // （事后从记录里反推不出用户当时填没填附加参数）。
             run.usage_capture = describeUsageCaptureMode(requestBody);
