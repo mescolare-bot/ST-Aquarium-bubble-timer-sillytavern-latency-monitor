@@ -3397,9 +3397,6 @@ function getRunAbnormalBilling(run) {
         status: billingStatus,
         label: ABNORMAL_BILLING_STATUS_LABELS[billingStatus]
             || (isPaidIncomplete ? "已付费未完成" : (billingConfirmed ? "已完成" : "费用未确认")),
-        paidText: isPaidIncomplete
-            ? "未完成"
-            : (billingConfirmed ? "已完成" : "未确认"),
         isPaidIncomplete,
         hasUsageTokens: hasUsageEvidence,
         usageTotalTokens: normalizeConfiguredPriceValue(abnormalDetail.usage_total_tokens),
@@ -4013,7 +4010,6 @@ function buildOutputCardSectionData(snapshot, fields) {
         ],
         diagnosisRows: [
             { label: "异常", value: snapshot.abnormalTypeLabel },
-            { label: "生成完成", value: snapshot.paidText },
             { label: "阶段", value: snapshot.failedStageLabel },
             { label: "流式", value: snapshot.streamText },
             { label: "部分输出", value: snapshot.hasPartialOutputText },
@@ -4174,9 +4170,6 @@ function getOutputCardSnapshot(run, fieldsOverride = null) {
         ? String(Number(run.request_plugin_match_score))
         : "-";
 
-    const paymentCompletionText = abnormalBilling
-        ? abnormalBilling.paidText
-        : (usageAvailable || estimatedPrice ? "已完成" : "未确认");
     const promptVolume = buildPromptVolumeInsight(getRunPromptBreakdown(run));
 
     return {
@@ -4199,7 +4192,6 @@ function getOutputCardSnapshot(run, fieldsOverride = null) {
         abnormalTypeLabel: abnormalType ? getAbnormalTypeLabel(abnormalType) : "-",
         failedStageLabel: failedStage ? getFailedStageLabel(failedStage) : "-",
         hasPartialOutputText: abnormalDetail ? formatBoolean(Boolean(abnormalDetail.has_partial_output)) : "-",
-        paidText: paymentCompletionText,
         billingStatusText: abnormalBilling?.label || (usageAvailable || estimatedPrice ? "已完成" : "费用未确认"),
         firstOutputEvidenceText: getRunFirstOutputEvidenceText(run),
         outputEvidenceText: getRunOutputEvidenceText(run),
@@ -4261,7 +4253,6 @@ function buildOutputCardText(run) {
         `usage 信号：${snapshot.usageEvidenceText}`,
         `上下文压力：${snapshot.contextPressureText}`,
         `判断结论：${snapshot.failureEvidenceSummaryText}`,
-        `生成完成：${snapshot.paidText}`,
         `卡住阶段：${snapshot.failedStageLabel}`,
         `总耗时：${snapshot.totalMsText}`,
         `预处理：${snapshot.preprocessMsText}`,
@@ -8289,7 +8280,6 @@ function buildRunHtml(run, { compactSummary = false, showWaitingQueueAction = tr
         ];
         sections.diagnosisRows = [
             { label: "异常", value: detailSnapshot.abnormalTypeLabel },
-            { label: "生成完成", value: detailSnapshot.paidText },
             { label: "阶段", value: detailSnapshot.failedStageLabel },
             { label: "流式", value: detailSnapshot.streamText },
             { label: "部分输出", value: detailSnapshot.hasPartialOutputText },
