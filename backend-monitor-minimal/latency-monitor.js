@@ -463,9 +463,10 @@ export function createGenerationMonitor(request) {
         }
     }
 
-    function captureText(text) {
-        run.output_chars = typeof text === 'string' ? text.length : null;
-    }
+    // 上游报错分支调这个，传进来的是错误响应体，不是模型正文。原来把它的长度写进
+    // output_chars，于是每条报错记录都"有输出"，被判成"部分输出后失败"，而实际上
+    // 一个字正文都没出。函数保留是因为酒馆源码里的补丁在调它，改签名就得重新打补丁。
+    function captureText() {}
 
     function captureError(error) {
         run.error = error instanceof Error ? error.message : String(error);
