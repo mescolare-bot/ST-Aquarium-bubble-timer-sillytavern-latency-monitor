@@ -3646,6 +3646,15 @@ function renderOutputCardSection(title, rows, note = "", rowsClass = "") {
     `;
 }
 
+// 快照里拿不到的值统一填成 "-"，所以判断某一行有没有实质内容不能只看真假。
+function hasDetailValue(value) {
+    if (typeof value !== "string") {
+        return value !== null && value !== undefined;
+    }
+    const trimmed = value.trim();
+    return Boolean(trimmed) && trimmed !== "-";
+}
+
 function renderHistoryDetailRows(rows) {
     return (rows || [])
         .filter((row) => row && row.value !== "")
@@ -7686,15 +7695,30 @@ function buildRunHtml(run, { compactSummary = false, showWaitingQueueAction = tr
             { label: "Completion", value: detailSnapshot.completionTokensText },
             { label: "Total", value: detailSnapshot.totalTokensText },
         ];
-        sections.rawRows = [
+        // 这两组字段面向的记录类型正好相反，揉在一节里会互相干扰：
+        // 注入来源是脚本往正文提示词里塞东西时才有的标记（这类请求本身仍算正文回复），
+        // 拓展识别只对拓展自己发的独立调用有意义。
+        const injectionSourceRows = [
             { label: "来源名称", value: detailSnapshot.injectionSourceLabel },
             { label: "来源标识", value: detailSnapshot.injectionSourceId },
             { label: "提示词来源", value: detailSnapshot.traceLabelsText, full: true },
             { label: "来源键", value: detailSnapshot.traceKeysText, full: true },
-            { label: "拓展标识", value: detailSnapshot.pluginIdText, full: true },
-            { label: "识别方式", value: detailSnapshot.pluginMatchModeLabel },
-            { label: "识别分数", value: detailSnapshot.pluginMatchScoreText },
         ];
+        sections.injectionSourceRows = injectionSourceRows.some((row) => hasDetailValue(row.value))
+            ? injectionSourceRows
+            : [];
+
+        // 拓展调用即使没认出来也要显示：那句"未识别"正是在提示该去等待区补标注。
+        // 正文回复没有可认的拓展，显示"未识别"只会让人以为出了故障。
+        const isPluginRun = run?.request_purpose === "non_chat_generation"
+            || run?.request_purpose === "plugin_internal_request";
+        sections.pluginMatchRows = isPluginRun || hasDetailValue(detailSnapshot.pluginIdText)
+            ? [
+                { label: "拓展标识", value: detailSnapshot.pluginIdText, full: true },
+                { label: "识别方式", value: detailSnapshot.pluginMatchModeLabel },
+                { label: "识别分数", value: detailSnapshot.pluginMatchScoreText },
+            ]
+            : [];
         return sections;
     })() : null;
     const estimatedPrice = getRunEstimatedPrice(run);
@@ -7780,7 +7804,8 @@ function buildRunHtml(run, { compactSummary = false, showWaitingQueueAction = tr
                     ${runOpen ? renderPromptVolumeSection(run) : ""}
                     ${detailSections ? renderHistoryDetailSection("注入概况", detailSections.injectionRows) : ""}
                     ${detailSections ? renderHistoryDetailSection("费用细项", detailSections.pricingRows, usageAvailable ? estimatedPriceNote : "") : ""}
-                    ${detailSections ? renderHistoryDetailSection("原始识别细节", detailSections.rawRows) : ""}
+                    ${detailSections ? renderHistoryDetailSection("注入来源", detailSections.injectionSourceRows) : ""}
+                    ${detailSections ? renderHistoryDetailSection("拓展识别", detailSections.pluginMatchRows) : ""}
                     ${abnormalDetail ? renderHistoryDetailSection("异常详情", abnormalRows, abnormalBilling?.note || "") : ""}
                 </div>
             ${showOutputCardAction && !compactSummary ? `
