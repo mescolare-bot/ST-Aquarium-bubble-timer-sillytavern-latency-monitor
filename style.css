@@ -399,6 +399,12 @@ body.stlp-page-host-open {
 }
 
 .stlp-minimized-button {
+    /* 图标尺寸、viewBox 边长、星星描边宽度都只在这里定义一次。
+       外圈的粗细由这三个值算出来，星星的 stroke-width 也从这里取，
+       两条线因此永远一样粗——改图标大小时不用记得再来对一次。 */
+    --stlp-minimized-icon-size: 28px;
+    --stlp-minimized-icon-viewbox: 24;
+    --stlp-minimized-star-stroke: 1.4;
     position: fixed;
     right: calc(18px + env(safe-area-inset-right));
     bottom: calc(18px + env(safe-area-inset-bottom));
@@ -411,7 +417,9 @@ body.stlp-page-host-open {
     /* 这三条都要 !important：按钮挂着酒馆的 .menu_button，特异性和这里完全相同，
        只靠后加载抢不稳。酒馆那边给的是 border 深色描边和 filter: grayscale(0.5)，
        后者会把用户在色轮里选的颜色削掉一半饱和度。 */
-    border: 1px solid var(--stlp-minimized-border, transparent) !important;
+    /* 星星的 stroke-width 是 SVG 用户单位，要乘上 viewBox 到实际像素的缩放比
+       才是屏幕上的粗细，外圈直接照这个值画。 */
+    border: calc(var(--stlp-minimized-star-stroke) * var(--stlp-minimized-icon-size) / var(--stlp-minimized-icon-viewbox)) solid var(--stlp-minimized-border, transparent) !important;
     filter: none !important;
     border-radius: 999px;
     background: var(--stlp-minimized-bg, transparent) !important;
@@ -431,10 +439,16 @@ body.stlp-page-host-open {
 
 .stlp-minimized-icon-svg {
     display: block;
-    width: 28px;
-    height: 28px;
+    width: var(--stlp-minimized-icon-size);
+    height: var(--stlp-minimized-icon-size);
     flex: 0 0 auto;
     pointer-events: none;
+}
+
+/* CSS 的优先级高于 SVG 上那个 stroke-width 属性，所以这里说了算；
+   属性值保留着，纯粹当样式表没加载时的兜底。 */
+.stlp-minimized-icon-svg path {
+    stroke-width: var(--stlp-minimized-star-stroke);
 }
 
 .stlp-minimized-icon-svg * {
