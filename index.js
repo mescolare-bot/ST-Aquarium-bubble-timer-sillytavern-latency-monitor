@@ -174,6 +174,9 @@ const KNOWN_PLUGIN_LABELS = {
     "schedule-planner": "构画",
     "st-sevendayscal": "构画",
     "st-seven-days-cal": "构画",
+    // 认不出拓展时的占位 id。现在写的是连字符版（它再 slugify 一次还是自己），
+    // 下划线版是这个改动之前落盘的老记录，一并留着。
+    "unknown-plugin": "未知拓展调用",
     "unknown_plugin": "未知拓展调用",
 };
 
@@ -3019,6 +3022,12 @@ function normalizePluginKey(value) {
         : "";
 }
 
+// 占位 id 有两种写法：连字符版是现在写入的，下划线版存在于旧记录里。
+function isUnknownPluginKey(value) {
+    const normalizedKey = normalizePluginKey(value);
+    return normalizedKey === "unknown-plugin" || normalizedKey === "unknown_plugin";
+}
+
 function getKnownPluginLabel(value) {
     const normalizedKey = normalizePluginKey(value);
     return normalizedKey ? (KNOWN_PLUGIN_LABELS[normalizedKey] || "") : "";
@@ -3163,7 +3172,7 @@ function isUnknownPluginRun(run) {
     const pluginKey = normalizePluginKey(run?.request_plugin);
     const matchMode = typeof run?.request_plugin_match_mode === "string" ? run.request_plugin_match_mode : "";
     return run?.request_purpose === "non_chat_generation"
-        && (!pluginKey || pluginKey === "unknown_plugin" || matchMode === "fallback_unknown" || matchMode === "none");
+        && (!pluginKey || isUnknownPluginKey(pluginKey) || matchMode === "fallback_unknown" || matchMode === "none");
 }
 
 function findRunById(runId) {
