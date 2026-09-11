@@ -3755,22 +3755,43 @@ function getRunOutputEvidenceText(run) {
     return hasRunRecordedOutput(run) ? "已收到正文内容" : "未收到正文内容";
 }
 
-// 精简模式拿不到 token 的成因，对应 describeUsageCaptureMode 写在记录上的标记。
+// 拿不到 token 的成因，对应 describeUsageCaptureMode 写在记录上的标记。
 // response_body 故意不列：非流式的用量本来就在响应体里，拿不到是真异常，
 // 给它配一句"正常解释"反而会盖住问题。
-const LITE_USAGE_UNAVAILABLE_NOTES = {
-    source_no_passthrough: "酒馆不向前端透传这个接入源的用量，改用自定义接口可解",
+//
+// injected 这一条要给出路，不能只陈述事实：它是三种里最常撞上的，而且真的有解。
+// 酒馆自己从不索要用量（整个 src/ 和 public/ 里搜不到 include_usage），所以流式
+// 全靠这个注入；非流式则直接从响应体里读，不依赖任何注入。服务器上的记录印证了
+// 这个出路——同一个中转，假流式线路流式 0/27 拿到用量，非流式 338/338 全拿到。
+//
+// 这三种成因只属于精简版：注入本身就只在精简形态下做，见 isUsageInjectionCandidate。
+const USAGE_UNAVAILABLE_NOTES = {
+    // 原文案写的是"酒馆不向前端透传这个接入源的用量"，不准确：酒馆对所有接入源都用
+    // forwardFetchResponse 原样转发上游的流。真正的原因是 custom_include_body 只在
+    // 自定义源的分支里被合并（chat-completions.js:2304-2319、openai.js:37-40），
+    // 别的接入源根本没有可注入的口子。
+    source_no_passthrough: "只有「自定义」接入源能注入要用量的参数，改用自定义接口可解",
     skipped_user_params: "你填了附加参数，插件没敢注入，以免弄坏你的配置",
-    injected: "这个接口不返回用量",
+    injected: "中转收下了要用量的参数却不回用量，假流式线路常见；关掉流式多半能拿到",
 };
 
-function getLiteUsageUnavailableNote(run) {
-    if (run?.record_source !== "frontend") {
-        return "";
+// 精简版会把成因算在记录上——它真的注入过要用量的参数，所以能说清是三种里的哪一种。
+// 完整版从不注入（isUsageInjectionCandidate 第一关就要求是精简形态），成因因此只有一种，
+// 而且和接入源无关：没人向上游要过用量，能不能拿到全看这条线路自己回不回。
+//
+// 非流式一律不给解释：那时用量直接在响应体里，拿不到是真异常，配一句"正常解释"会盖住问题。
+// 精简版的老记录没有 usage_capture 标记，但带着 record_source，不会被错当成完整版记录，
+// 于是退回原来的措辞，不硬编解释。
+function getUsageUnavailableNote(run) {
+    if (run?.usage_capture) {
+        return USAGE_UNAVAILABLE_NOTES[run.usage_capture] || "";
     }
 
-    // 改动之前记的老记录没有这个标记，查不到就退回原来的措辞，不硬编解释。
-    return LITE_USAGE_UNAVAILABLE_NOTES[run?.usage_capture] || "";
+    if (run?.record_source !== "frontend" && run?.stream) {
+        return "完整版不向上游索要用量，拿不拿得到全看这条线路自己；非流式则直接从响应体里读";
+    }
+
+    return "";
 }
 
 function getRunUsageEvidenceText(run, abnormalBilling, usageAvailable) {
@@ -3778,7 +3799,7 @@ function getRunUsageEvidenceText(run, abnormalBilling, usageAvailable) {
         return "已拿到 usage";
     }
 
-    const unavailableNote = getLiteUsageUnavailableNote(run);
+    const unavailableNote = getUsageUnavailableNote(run);
     if (unavailableNote) {
         return `未拿到 usage：${unavailableNote}`;
     }
@@ -4232,7 +4253,11 @@ function getOutputCardSnapshot(run, fieldsOverride = null) {
         estimatedPriceText: estimatedPrice ? formatPriceWithCurrency(estimatedPrice.totalCost, estimatedPrice.currency) : "-",
         estimatedPriceNote: estimatedPrice
             ? estimatedPrice.note
-            : (usageAvailable ? "未配置该模型价格，暂不显示金额估算" : "当前未拿到 usage，暂不显示金额估算"),
+            // 拿不到 token 时要替用户否掉"是不是我价格配错了"这个猜测——他配了价格、
+            // 看到空的，第一反应必然是怀疑自己，而成因其实写在上面那行 usage 信号里。
+            : (usageAvailable
+                ? "未配置该模型价格，暂不显示金额估算"
+                : "没拿到 token 数，价格无从计算——不是你的价格没配对，成因见上方 usage 信号"),
         runIdText: run?.id || "-",
         shortRunIdText: shortenRunId(run?.id) || "-",
         modelText: run?.model || "-",
