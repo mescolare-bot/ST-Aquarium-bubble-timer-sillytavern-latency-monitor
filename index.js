@@ -3424,7 +3424,8 @@ function filterRunsByAbnormal(runs, abnormalOnly = false) {
         return list;
     }
 
-    return list.filter(isAbnormalRun);
+    // 和后端 shared/run-query.js 的同名函数保持一致：被重发取代的尝试不算故障。
+    return list.filter((run) => isAbnormalRun(run) && !isSupersededRetryRun(run));
 }
 
 function getActiveRunFilters() {
@@ -5435,6 +5436,14 @@ function endMinimizedButtonDrag(event) {
 
 function isAbnormalRun(run) {
     return Boolean(run?.abnormal_detail?.abnormal_type);
+}
+
+// 这个标记是 /runs 下发的，由 shared/run-query.js 的 markSupersededRetryRuns 算出来。
+// 前端刻意不重算：完整安装的拓展目录里只有 index.js、style.css、manifest.json 和
+// lite/run-store.js（见 install.mjs 的 COPY_PLAN），根本够不着 shared/，
+// 而这里再抄一份判定，迟早会和那边分叉。
+function isSupersededRetryRun(run) {
+    return Boolean(run?.retry_superseded);
 }
 
 function buildSectionHtml(sectionKey, title, bodyHtml, { statusIndicatorClass = "", statusIndicatorPosition = "before", sectionClass = "", titleHtml = "" } = {}) {
@@ -7990,7 +7999,8 @@ function buildSummaryHtml() {
         ? '<div class="stlp-empty">当前还没有可汇总的后台监控记录。</div>'
         : (() => {
             // 汇总区固定用全局口径，不跟随上方的筛选勾选，避免统计范围被筛选悄悄改掉。
-            const abnormalCount = filterRunsByRequestPurpose(state.runs).filter(isAbnormalRun).length;
+            const abnormalCount = filterRunsByRequestPurpose(state.runs)
+                .filter((run) => isAbnormalRun(run) && !isSupersededRetryRun(run)).length;
             return `
             <div class="stlp-grid">
                 <div><strong>记录数</strong><span>${escapeHtml(state.summary.total_runs ?? "-")}</span></div>
@@ -8112,6 +8122,7 @@ function buildHistoryPreviewItem(run) {
                 <span class="stlp-badge">${escapeHtml(floorLabel || "未标楼层")}</span>
                 <span>${escapeHtml(run?.model || "未记录模型")}</span>
                 <span>${escapeHtml(summaryLabel)}</span>
+                ${isSupersededRetryRun(run) ? `<span class="stlp-badge stlp-badge-superseded">重发前的尝试</span>` : ""}
                 ${httpStatusFailed ? `<span class="stlp-badge stlp-badge-http-failed">${escapeHtml(getHttpStatusLabel(run))}</span>` : ""}
             </div>
             <div class="stlp-history-preview-meta">
@@ -8257,8 +8268,11 @@ function buildRunHtml(run, { compactSummary = false, showWaitingQueueAction = tr
     const abnormalDetail = run?.abnormal_detail;
     const abnormalBilling = getRunAbnormalBilling(run);
     const suggestions = abnormalDetail?.optimization_suggestions?.suggestions ?? [];
+    const supersededRetry = isSupersededRetryRun(run);
     const summaryLabel = isAbnormalRun(run) ? getAbnormalTypeLabel(abnormalDetail.abnormal_type) : "正常完成";
-    const statusBadgeClass = isAbnormalRun(run) ? "stlp-badge stlp-badge-abnormal" : "stlp-badge";
+    // 异常类型照常写出来，那是事实；但不涂成故障色——被重发取代的尝试不是故障，
+    // 红色恰恰是"看着像出事了"的来源。
+    const statusBadgeClass = isAbnormalRun(run) && !supersededRetry ? "stlp-badge stlp-badge-abnormal" : "stlp-badge";
     const pluginLabel = getRunPluginLabel(run);
     const generationTypeLabel = getRunGenerationTypeLabel(run);
     const failedStage = getRunFailedStage(run);
@@ -8361,6 +8375,7 @@ function buildRunHtml(run, { compactSummary = false, showWaitingQueueAction = tr
         startedAtCompact,
         run?.model || "未记录模型",
         summaryLabel,
+        supersededRetry ? "重发前的尝试" : "",
         `总耗时 ${formatSeconds(run?.metrics?.total_ms)}`,
     ].filter(Boolean).join(" · ");
     const toggleRunButtonHtml = `
@@ -8402,6 +8417,7 @@ function buildRunHtml(run, { compactSummary = false, showWaitingQueueAction = tr
                         <span class="stlp-badge">${escapeHtml(startedAtCompact)}</span>
                         <span>${escapeHtml(run?.model || "未记录模型")}</span>
                         <span class="${statusBadgeClass}">${escapeHtml(summaryLabel)}</span>
+                        ${supersededRetry ? `<span class="stlp-badge stlp-badge-superseded" title="这次生成的请求被重发过，这一条是被取代的那次尝试，不是故障">重发前的尝试</span>` : ""}
                         ${failedStage ? `<span class="stlp-badge stlp-badge-stage">卡在 ${escapeHtml(failedStageLabel)}</span>` : ""}
                         <span>总耗时 ${escapeHtml(formatSeconds(run?.metrics?.total_ms))}</span>
                     `}

@@ -3519,6 +3519,15 @@ body.stlp-page-host-open {
     font-weight: 700;
 }
 
+/* 被重发取代的尝试：标出来，但压下去。它不是故障，不该和真异常抢注意力，
+   所以用虚线描边加弱化字色，和实心的告警徽标一眼就能分开。 */
+.stlp-badge-superseded {
+    background: transparent;
+    color: var(--stlp-muted-text);
+    border: 1px dashed var(--stlp-border-soft);
+    box-shadow: none;
+}
+
 .stlp-badge-injection {
     background: color-mix(in srgb, var(--stlp-primary) 20%, var(--stlp-surface-1));
     color: var(--stlp-panel-text);
@@ -3531,6 +3540,16 @@ body.stlp-page-host-open {
     color: var(--stlp-panel-text);
     border: 1px solid color-mix(in srgb, var(--stlp-primary) 44%, transparent);
     font-weight: 700;
+}
+
+/* 被重发取代的尝试：刻意比普通徽标还淡。它标的不是故障，是"这条不用看"，
+   做得显眼反而和它想解决的问题（记录看着像故障）背道而驰。 */
+.stlp-badge-superseded {
+    background: transparent;
+    color: var(--stlp-muted-text);
+    border: 1px dashed var(--stlp-border-soft);
+    box-shadow: none;
+    font-weight: 600;
 }
 
 .stlp-page-host.stlp-theme-dawn .stlp-badge-abnormal,

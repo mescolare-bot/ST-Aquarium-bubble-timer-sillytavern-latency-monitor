@@ -2,7 +2,7 @@
 // 因为纯前端形态要用同一份筛选和统计逻辑——两种形态的"只看异常""只看缓存命中"
 // 和日聚合必须给出完全一致的结果，各写一份迟早会分叉。
 
-import { normalizeModelName } from './run-analysis.js';
+import { hasRecordedOutput, normalizeModelName } from './run-analysis.js';
 
 export { normalizeModelName };
 
@@ -47,12 +47,79 @@ export function readRequestedFlag(value) {
     return text === '1' || text === 'true' || text === 'yes';
 }
 
+// 一次生成有时会落成好几条记录：请求体被重发时，同一个 request_client_generation_id
+// 会出现在多条上。酒馆每次生成都新建请求体（openai.js 里 generate_data 是对象字面量），
+// 所以共享这个 id 的必定属于同一次生成，拿它当分组键是确定的，不必靠时间窗口猜。
+//
+// 被重发取代的那几次不是故障，只是没走通的尝试，但它们现在以"连接中断"的身份混在
+// 异常列表里——你只点了一次发送，排障卡里却多出两条看着像故障的记录。
+//
+// 判定刻意收得很紧：只有"一个字正文都没出、且死于连接中断"的才算被取代的尝试。
+// 有正文的一概不算。线上确实存在一组共享 id 但首次正常返回的记录，成因至今没查清，
+// 与其用一条自己都没吃透的规则把它藏起来，不如让它原样显示。
+export function findSupersededRetryRunIds(runs) {
+    const groups = new Map();
+
+    for (const run of Array.isArray(runs) ? runs : []) {
+        const generationId = normalizeOptionalText(run?.request_client_generation_id, 100);
+        if (!generationId || typeof run?.id !== 'string') {
+            continue;
+        }
+
+        const group = groups.get(generationId);
+        if (group) {
+            group.push(run);
+        } else {
+            groups.set(generationId, [run]);
+        }
+    }
+
+    const supersededIds = new Set();
+    for (const group of groups.values()) {
+        if (group.length < 2) {
+            continue;
+        }
+
+        // 最后一次才是最终生效的那次，无论它自己成没成功。
+        group.sort((left, right) => (left.started_at_ms ?? 0) - (right.started_at_ms ?? 0));
+        const attempts = group.slice(0, -1);
+        if (!attempts.every(isSupersededRetryAttempt)) {
+            continue;
+        }
+
+        for (const attempt of attempts) {
+            supersededIds.add(attempt.id);
+        }
+    }
+
+    return supersededIds;
+}
+
+function isSupersededRetryAttempt(run) {
+    return run?.abnormal_detail?.abnormal_type === 'client_disconnected' && !hasRecordedOutput(run);
+}
+
+// 标记而不是落盘：这是读取时算出来的，所以历史记录立刻就能受益，不用迁移数据。
+// 必须喂全量记录——只喂筛过的子集会让链条缺员，最后那次成功的记录不在里面时，
+// 倒数第二次就会被错当成"最终生效的那次"而漏标。
+export function markSupersededRetryRuns(runs) {
+    const list = Array.isArray(runs) ? runs : [];
+    const supersededIds = findSupersededRetryRunIds(list);
+    if (!supersededIds.size) {
+        return list;
+    }
+
+    return list.map((run) => (supersededIds.has(run?.id) ? { ...run, retry_superseded: true } : run));
+}
+
 export function filterRunsByAbnormal(runs, abnormalOnly = false) {
     if (!abnormalOnly) {
         return runs;
     }
 
-    return runs.filter((run) => isAbnormalRun(run));
+    // 被重发取代的尝试仍然带着异常类型（卡片上照常写明"连接中断"），只是不该在
+    // "只看异常"里冒充故障——那个筛选是用来找真问题的。
+    return runs.filter((run) => isAbnormalRun(run) && !run?.retry_superseded);
 }
 
 export function filterRunsByCacheHit(runs, cacheHitOnly = false) {
