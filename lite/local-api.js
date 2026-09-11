@@ -13,6 +13,7 @@ import {
     filterRunsByCacheHit,
     filterRunsByChatKey,
     filterRunsByPurpose,
+    markSupersededRetryRuns,
     normalizeOptionalText,
     readRequestedFlag,
     toClientRuns,
@@ -237,7 +238,8 @@ async function handleRuns(query) {
     const cacheHitOnly = readRequestedFlag(query.cache_hit);
     const includePromptBreakdown = readRequestedFlag(query.include_prompt_breakdown);
 
-    const allRuns = await readAllRuns();
+    // 先标记再筛选：识别重发链要看到全量记录，筛过之后链条会缺员。
+    const allRuns = markSupersededRetryRuns(await readAllRuns());
     const filteredRuns = filterRunsByCacheHit(
         filterRunsByAbnormal(
             filterRunsByChatKey(filterRunsByPurpose(allRuns, requestedPurpose), requestedChatKey),

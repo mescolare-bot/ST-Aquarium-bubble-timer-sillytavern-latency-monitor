@@ -31,6 +31,7 @@ import {
     filterRunsByCacheHit,
     filterRunsByChatKey,
     filterRunsByPurpose,
+    markSupersededRetryRuns,
     normalizeOptionalText,
     normalizeUsageValue,
     readRequestedFlag,
@@ -829,7 +830,8 @@ export async function init(router) {
         const abnormalOnly = readRequestedFlag(req.query.abnormal_only);
         const cacheHitOnly = readRequestedFlag(req.query.cache_hit);
         const includePromptBreakdown = readRequestedFlag(req.query.include_prompt_breakdown);
-        const allRuns = await readRuns(1000000, 0);
+        // 先标记再筛选：识别重发链要看到全量记录，筛过之后链条会缺员。
+        const allRuns = markSupersededRetryRuns(await readRuns(1000000, 0));
         const filteredRuns = filterRunsByCacheHit(
             filterRunsByAbnormal(
                 filterRunsByChatKey(filterRunsByPurpose(allRuns, requestedPurpose), requestedChatKey),
