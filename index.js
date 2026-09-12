@@ -336,10 +336,13 @@ const PRICING_CURRENCY_LABELS = {
     cny: "人民币",
 };
 
-const PRICING_NUMBER_FIELDS = [
+const PRICING_BASE_NUMBER_FIELDS = [
     "input_price_per_million",
     "cached_input_price_per_million",
     "output_price_per_million",
+];
+
+const PRICING_PEAK_VALLEY_NUMBER_FIELDS = [
     "peak_input_price_per_million",
     "peak_cached_input_price_per_million",
     "peak_output_price_per_million",
@@ -347,6 +350,8 @@ const PRICING_NUMBER_FIELDS = [
     "valley_cached_input_price_per_million",
     "valley_output_price_per_million",
 ];
+
+const PRICING_NUMBER_FIELDS = [...PRICING_BASE_NUMBER_FIELDS, ...PRICING_PEAK_VALLEY_NUMBER_FIELDS];
 
 const PRICING_TIME_FIELDS = [
     "peak_start_time",
@@ -2964,8 +2969,18 @@ function normalizePricingConfigMap(value) {
     return nextMap;
 }
 
+// 峰谷价只在开关打开时才会被读到——getRunPeakValleySelection 第一行就在开关关着时返回 null。
+// 关着的时候这六个字段对计价毫无影响，自然也不该让一条只剩它们有值的配置算作"配过价"。
+//
+// 这不是假想的边界。老版本曾把空字段写成 0（成因见 normalizeConfiguredPriceValue 上的注释），
+// 那批 0 冻在设置文件里，之后每次保存又被原样带上，用户在界面上怎么清都清不掉——输入框还把 0
+// 显示成空，看着已经清干净了。不挡住的话这种配置会被判成已配置，于是既盖住了剥前缀回退，
+// 自己又没有主价格可用，金额永远算不出来。
 function hasConfiguredPriceValues(config) {
-    return PRICING_NUMBER_FIELDS.some((fieldName) => normalizeConfiguredPriceValue(config?.[fieldName]) !== null);
+    const fieldNames = config?.peak_valley_enabled
+        ? PRICING_NUMBER_FIELDS
+        : PRICING_BASE_NUMBER_FIELDS;
+    return fieldNames.some((fieldName) => normalizeConfiguredPriceValue(config?.[fieldName]) !== null);
 }
 
 function getRunPricingReferenceDate(run) {
