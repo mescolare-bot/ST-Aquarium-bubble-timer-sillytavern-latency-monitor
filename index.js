@@ -3273,6 +3273,135 @@ function collectPricingModels() {
     return Array.from(modelMap.values()).sort((left, right) => right.run_count - left.run_count || left.model.localeCompare(right.model));
 }
 
+// 从左往右逐段剥掉 `/` 前缀，得到这个名字可能的底模名，长的在前。
+// 和 resolveModelPricingEntry 的候选生成是同一套规则，区别只是这里不含名字自己。
+function getPricingBaseNameCandidates(modelName) {
+    const candidates = [];
+    let rest = typeof modelName === "string" ? modelName : "";
+    let separatorIndex = rest.indexOf("/");
+    while (separatorIndex >= 0) {
+        rest = rest.slice(separatorIndex + 1);
+        if (rest) {
+            candidates.push(rest);
+        }
+        separatorIndex = rest.indexOf("/");
+    }
+
+    return candidates;
+}
+
+// 中转给同一个模型套不同路由前缀时（假流式/X、流式抗截断/X），设置页会把它们列成几条
+// 互不相干的条目。计价那边早就会剥前缀回退了（resolveModelPricingEntry），可那个"沿用 X"
+// 只在底模已经配好之后才显示——第一次配置的人看到的是三条都写着"价格待填"，没有任何
+// 线索说它们是同一个模型，于是自然挑自己眼熟的带前缀那条去填，反而因为"显式配置优先"
+// 把统一价格挡掉了。这个函数只负责把关系摆到明面上，不碰计价逻辑本身。
+function groupPricingModelsByBaseName(models) {
+    const list = Array.isArray(models) ? models : [];
+    const modelInfoByName = new Map(list.map((modelInfo) => [modelInfo.model, modelInfo]));
+
+    // 第一轮：归到列表里真实存在的底模。这里要求底模必须存在，不能简单地剥到最后一段：
+    // 记录里就有 deepseek-ai/DeepSeek-V4-Flash 这种名字自带斜杠的，剥到底会得出谁都没用过的
+    // DeepSeek-V4-Flash，等于把一条好好的条目拆坏。候选是从长到短给的，取第一个命中的，
+    // 所以 Pro/deepseek-ai/DeepSeek-V3 会归到 deepseek-ai/DeepSeek-V3 而不是 DeepSeek-V3。
+    const baseNameByModel = new Map();
+    for (const modelInfo of list) {
+        for (const candidate of getPricingBaseNameCandidates(modelInfo.model)) {
+            if (modelInfoByName.has(candidate)) {
+                baseNameByModel.set(modelInfo.model, candidate);
+                break;
+            }
+        }
+    }
+
+    // 第二轮：两条以上变体共享同一个后缀、而这个后缀不在列表里时，把它合成一条组头。
+    // 精简版只有本机浏览器的记录，很可能从没用过裸名字，没有这一步整个分组对它就是空转，
+    // 而设置页又没有手动添加模型名的入口，用户根本无从把价格配到底模上。
+    //
+    // 卡死在"两条以上"是因为只有一条时分不清那个斜杠是中转加的路由前缀还是模型名自带的，
+    // 凭一条就合成会造出谁都没用过的名字。两个不同前缀指向同一后缀，才算这个后缀是真模型名。
+    const orphans = list.filter((modelInfo) => !baseNameByModel.has(modelInfo.model));
+    const sharedSuffixOwners = new Map();
+    for (const modelInfo of orphans) {
+        for (const candidate of getPricingBaseNameCandidates(modelInfo.model)) {
+            const owners = sharedSuffixOwners.get(candidate) ?? new Set();
+            owners.add(modelInfo.model);
+            sharedSuffixOwners.set(candidate, owners);
+        }
+    }
+    for (const modelInfo of orphans) {
+        for (const candidate of getPricingBaseNameCandidates(modelInfo.model)) {
+            if ((sharedSuffixOwners.get(candidate)?.size ?? 0) >= 2) {
+                baseNameByModel.set(modelInfo.model, candidate);
+                break;
+            }
+        }
+    }
+
+    // 链条收敛：假流式/a/b → a/b → b 同时存在时，整条链都归到最终的 b，和计价那边
+    // 逐段回退的行为一致。每一步名字都严格变短，绕不成环。
+    const resolveRootName = (modelName) => {
+        let current = modelName;
+        while (baseNameByModel.has(current)) {
+            current = baseNameByModel.get(current);
+        }
+        return current;
+    };
+
+    const groups = new Map();
+    for (const modelInfo of list) {
+        const rootName = resolveRootName(modelInfo.model);
+        if (rootName === modelInfo.model) {
+            continue;
+        }
+
+        let group = groups.get(rootName);
+        if (!group) {
+            group = {
+                kind: "group",
+                base: modelInfoByName.get(rootName) ?? {
+                    model: rootName,
+                    run_count: 0,
+                    supports_usage: false,
+                    configured: false,
+                },
+                baseSynthesized: !modelInfoByName.has(rootName),
+                variants: [],
+            };
+            groups.set(rootName, group);
+        }
+        group.variants.push(modelInfo);
+    }
+
+    const entries = [];
+    for (const modelInfo of list) {
+        if (resolveRootName(modelInfo.model) !== modelInfo.model) {
+            continue;
+        }
+        entries.push(groups.get(modelInfo.model) ?? { kind: "single", base: modelInfo });
+    }
+    // 合成出来的组头不在 list 里，上面那轮遍历不到，单独补进来。
+    for (const group of groups.values()) {
+        if (group.baseSynthesized) {
+            entries.push(group);
+        }
+    }
+
+    const getEntryWeight = (entry) => (entry.kind === "group"
+        ? Math.max(entry.base.run_count, ...entry.variants.map((variant) => variant.run_count))
+        : entry.base.run_count);
+
+    for (const entry of entries) {
+        if (entry.kind === "group") {
+            entry.variants.sort((left, right) => right.run_count - left.run_count || left.model.localeCompare(right.model));
+        }
+    }
+
+    return entries.sort((left, right) => (
+        getEntryWeight(right) - getEntryWeight(left)
+        || left.base.model.localeCompare(right.base.model)
+    ));
+}
+
 function getRunEstimatedPrice(run) {
     const usage = getRunUsage(run);
     const pricingEntry = resolveModelPricingEntry(run?.model);
@@ -7328,6 +7457,80 @@ function buildWaitingQueueViewHtml() {
     `;
 }
 
+// 把分组结果摊平成渲染单元：组头单独一行，卡片本身结构不变。
+// 不做嵌套是有代价考量的——展开状态 pricingPanelOpenStates 和「仅存本机」都按模型名算，
+// 平铺能一行不改地沿用，嵌套就得把这两套状态一起重构。
+function buildPricingRenderUnits(pricingModels) {
+    const units = [];
+    for (const entry of groupPricingModelsByBaseName(pricingModels)) {
+        if (entry.kind === "single") {
+            units.push({ kind: "model", modelInfo: entry.base });
+            continue;
+        }
+
+        const groupSize = entry.variants.length + 1;
+        units.push({ kind: "group-head", entry });
+        units.push({
+            kind: "model",
+            modelInfo: entry.base,
+            inGroup: true,
+            baseName: entry.base.model,
+            synthesized: entry.baseSynthesized,
+            groupSize,
+        });
+        for (const variant of entry.variants) {
+            units.push({
+                kind: "model",
+                modelInfo: variant,
+                inGroup: true,
+                isVariant: true,
+                baseName: entry.base.model,
+                groupSize,
+            });
+        }
+    }
+    return units;
+}
+
+// 组头只写说明，不写底模名字。名字就印在紧挨着的第一张卡片上，
+// 组头再挂一遍会连着出现两次同一个名字——合成出来的组头也一样，它同样有自己的卡片。
+function buildPricingGroupHeadHtml(entry) {
+    const groupSize = entry.variants.length + 1;
+    const note = entry.baseSynthesized
+        ? `下面 ${groupSize} 条是同一个模型。第一条的名字你没直接用过，是从其余几条的共同后缀推出来的，价格填在那儿整组都按它算`
+        : `下面 ${groupSize} 条是同一个模型，价格配第一条就够`;
+
+    return `
+        <div class="stlp-pricing-group-head">
+            <span class="stlp-pricing-model-note">${escapeHtml(note)}</span>
+        </div>
+    `;
+}
+
+// 组内提示。真实踩过的坑是：给带前缀的名字单独配了价，反而把统一价格挡掉了。
+// 那个"显式配置优先"是 resolveModelPricingEntry 刻意的设计（硅基流动的 Pro/ 付费档
+// 得靠它盖住便宜的普通档），改不得，所以只能在这里把话说清楚。
+function describePricingGroupNote(unit) {
+    if (!unit?.inGroup) {
+        return "";
+    }
+
+    const baseName = unit.baseName;
+    if (!unit.isVariant) {
+        return unit.synthesized
+            ? "这个名字你没直接用过，是从下面几条的共同后缀推出来的。价格填在这里，整组都按它算。"
+            : "价格填在这一条上，同组带前缀的都会自动沿用。";
+    }
+
+    if (!hasConfiguredPriceValues(getModelPriceConfig(unit.modelInfo.model) ?? {})) {
+        return `没有单独配价时，这条按 ${baseName} 的价格算。`;
+    }
+
+    return hasConfiguredPriceValues(getModelPriceConfig(baseName) ?? {})
+        ? `这条用的是自己配的价格，不走 ${baseName}。如果不是有意给它单独定价，把下面的价格字段清空就会改用 ${baseName}。`
+        : `同组只有这条配了价格，另外 ${unit.groupSize - 1} 条算不出金额。把价格填到 ${baseName} 上，整组就都有了。`;
+}
+
 function buildSettingsContentHtml() {
     const displaySettings = state.settings?.display ?? {};
     const runtimeSettings = state.settings?.runtime ?? {};
@@ -7336,6 +7539,7 @@ function buildSettingsContentHtml() {
     // 精简版没有落盘的地方，这个开关开了也不会有记录，所以整项不显示。
     const supportsForceStopDiagnostics = permissionLevel !== "no_backend";
     const pricingModels = collectPricingModels();
+    const pricingRenderUnits = buildPricingRenderUnits(pricingModels);
     const localOnlyPricedModels = new Set(getLocalOnlyPricedModels());
     const outputCardFields = getOutputCardFields();
     const settingsCategory = normalizeSettingsCategory(state.uiSettings.settingsCategory);
@@ -7414,6 +7618,7 @@ function buildSettingsContentHtml() {
     `;
 
     const pricingContent = `
+        <div class="stlp-pricing-section">
             <div class="stlp-settings-subtitle">模型价格估算</div>
             <div class="stlp-note">这里会列出后台已经抓到的模型。每个模型都可以单独选择美元或人民币，填写输入 / 缓存输入 / 输出每 100 万 Token 的价格；详情里的估算金额会跟着这个模型自己的单位显示。峰谷计费按本机时间判断，只需要配置峰时段，其余时间会自动按谷时段计算。</div>
             ${localOnlyPricedModels.size ? `
@@ -7426,7 +7631,12 @@ function buildSettingsContentHtml() {
                 <div class="stlp-note">当前还没抓到任何模型。等后台先记录几次生成后，这里会自动列出模型。</div>
             ` : `
                 <div class="stlp-pricing-model-list">
-                    ${pricingModels.map((modelInfo) => {
+                    ${pricingRenderUnits.map((unit) => {
+                        if (unit.kind === "group-head") {
+                            return buildPricingGroupHeadHtml(unit.entry);
+                        }
+
+                        const modelInfo = unit.modelInfo;
                         const modelName = modelInfo.model;
                         const config = getModelPriceConfig(modelName) ?? {};
                         const currency = normalizePricingCurrency(config.currency);
@@ -7481,17 +7691,23 @@ function buildSettingsContentHtml() {
                                 ? `${inheritedCurrencyLabel} · 沿用 ${inheritedPricingEntry.modelName}`
                                 : `${currencyLabel} · 价格待填`);
                         const pricingLocalOnly = localOnlyPricedModels.has(modelName);
+                        const groupNote = describePricingGroupNote(unit);
+                        // 卡片收起时正文是藏着的，而"这条单独定价、把底模盖住了"恰恰最该在列表层面
+                        // 就看见，所以折叠标题上也挂一个短标。措辞取中性的"单独定价"：付费档本来就
+                        // 该这么配，是不是配错了只有用户自己清楚，判断依据写在正文那句话里。
+                        const pricingShadowsBase = Boolean(unit.isVariant) && hasConfiguredPriceValues(config);
 
                         return `
-                            <div class="stlp-pricing-model-card ${panelOpen ? "is-open" : ""}">
+                            <div class="stlp-pricing-model-card ${panelOpen ? "is-open" : ""} ${unit.inGroup ? "stlp-pricing-model-card-grouped" : ""} ${unit.isVariant ? "stlp-pricing-model-card-variant" : ""}">
                                 <button class="stlp-pricing-model-summary" type="button" data-action="toggle-pricing-panel" data-pricing-model="${escapeHtml(modelName)}" aria-expanded="${panelOpen ? "true" : "false"}">
                                     <span class="stlp-pricing-model-summary-main">
                                         <span class="stlp-pricing-model-name">${escapeHtml(modelName)}</span>
-                                        <span class="stlp-pricing-model-note">${escapeHtml(compactSummary)}${pricingLocalOnly ? ` · <span class="stlp-pricing-local-only">仅存本机</span>` : ""}</span>
+                                        <span class="stlp-pricing-model-note">${escapeHtml(compactSummary)}${pricingLocalOnly ? ` · <span class="stlp-pricing-local-only">仅存本机</span>` : ""}${pricingShadowsBase ? ` · <span class="stlp-pricing-group-shadow">单独定价</span>` : ""}</span>
                                     </span>
                                     <span class="stlp-pricing-model-chevron" aria-hidden="true">▾</span>
                                 </button>
                                 <div class="stlp-pricing-model-body ${panelOpen ? "" : "stlp-hidden"}">
+                                    ${groupNote ? `<div class="stlp-pricing-group-note">${escapeHtml(groupNote)}</div>` : ""}
                                     <div class="stlp-pricing-model-meta">
                                         <div class="stlp-pricing-model-note">价格状态：${escapeHtml(usageStatusSummary)}</div>
                                         <div class="stlp-pricing-model-note">抓取记录：${escapeHtml(runCountSummary)}</div>
@@ -7583,6 +7799,7 @@ function buildSettingsContentHtml() {
                     }).join("")}
                 </div>
             `}
+        </div>
     `;
 
     const minimizedButtonCustomColor = normalizeMinimizedButtonCustomColor(state.uiSettings.minimizedButtonCustomColor);
