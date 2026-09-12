@@ -673,18 +673,29 @@ function normalizeOptionalPricingValue(value) {
     return Number.isFinite(numberValue) && numberValue >= 0 ? numberValue : null;
 }
 
+const PRICING_BASE_NUMBER_FIELDS = [
+    'input_price_per_million',
+    'cached_input_price_per_million',
+    'output_price_per_million',
+];
+
+const PRICING_PEAK_VALLEY_NUMBER_FIELDS = [
+    'peak_input_price_per_million',
+    'peak_cached_input_price_per_million',
+    'peak_output_price_per_million',
+    'valley_input_price_per_million',
+    'valley_cached_input_price_per_million',
+    'valley_output_price_per_million',
+];
+
+// 峰谷开关关着时，那六个峰谷价根本不会参与计价，所以不该让一条只剩它们有值的配置算作
+// "配过价"。老版本曾把空字段写成 0，那批 0 冻在用户的设置文件里清不掉，不挡住的话会把
+// 剥前缀回退整个堵死。index.js 和 shared/run-analysis.js 里各还有一份，三处必须一致。
 function hasConfiguredPricingValue(config) {
-    return [
-        'input_price_per_million',
-        'cached_input_price_per_million',
-        'output_price_per_million',
-        'peak_input_price_per_million',
-        'peak_cached_input_price_per_million',
-        'peak_output_price_per_million',
-        'valley_input_price_per_million',
-        'valley_cached_input_price_per_million',
-        'valley_output_price_per_million',
-    ].some((fieldName) => normalizeOptionalPricingValue(config?.[fieldName]) !== null);
+    const fieldNames = config?.peak_valley_enabled
+        ? [...PRICING_BASE_NUMBER_FIELDS, ...PRICING_PEAK_VALLEY_NUMBER_FIELDS]
+        : PRICING_BASE_NUMBER_FIELDS;
+    return fieldNames.some((fieldName) => normalizeOptionalPricingValue(config?.[fieldName]) !== null);
 }
 
 function hasUsageData(run) {

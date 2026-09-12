@@ -369,18 +369,32 @@ export function normalizePricingConfig(config) {
     };
 }
 
+const PRICING_BASE_NUMBER_FIELDS = [
+    'input_price_per_million',
+    'cached_input_price_per_million',
+    'output_price_per_million',
+];
+
+const PRICING_PEAK_VALLEY_NUMBER_FIELDS = [
+    'peak_input_price_per_million',
+    'peak_cached_input_price_per_million',
+    'peak_output_price_per_million',
+    'valley_input_price_per_million',
+    'valley_cached_input_price_per_million',
+    'valley_output_price_per_million',
+];
+
+// 峰谷开关关着时，那六个峰谷价根本不会被读到（前端 getRunPeakValleySelection 第一行就返回
+// null），所以不该让一条只剩它们有值的配置算作"配过价"。老版本曾把空字段写成 0，那批 0 冻在
+// 用户的设置文件里清不掉，不挡住的话会把剥前缀回退整个堵死。
+//
+// 这个判断在 index.js 和 server-plugin/index.js 里各还有一份，三处必须一致，
+// .dbg/pricing-legacy-zero-test.mjs 有一条专门盯着它们别再分叉。
 export function hasConfiguredPricingValue(config) {
-    return [
-        'input_price_per_million',
-        'cached_input_price_per_million',
-        'output_price_per_million',
-        'peak_input_price_per_million',
-        'peak_cached_input_price_per_million',
-        'peak_output_price_per_million',
-        'valley_input_price_per_million',
-        'valley_cached_input_price_per_million',
-        'valley_output_price_per_million',
-    ].some((fieldName) => normalizeOptionalPricingNumber(config?.[fieldName]) !== null);
+    const fieldNames = config?.peak_valley_enabled
+        ? [...PRICING_BASE_NUMBER_FIELDS, ...PRICING_PEAK_VALLEY_NUMBER_FIELDS]
+        : PRICING_BASE_NUMBER_FIELDS;
+    return fieldNames.some((fieldName) => normalizeOptionalPricingNumber(config?.[fieldName]) !== null);
 }
 
 export function convertPricingTimeToMinutes(value) {
