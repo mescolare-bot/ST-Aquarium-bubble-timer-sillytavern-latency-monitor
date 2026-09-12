@@ -2203,10 +2203,30 @@ body.stlp-page-host-open {
     line-height: 1.4;
 }
 
+/* 这一节原来是几个块直接堆着：subtitle 和 note 都没有下边距，标题、说明、同步提示、
+   模型列表全靠行高的空隙撑开，窄屏上挤成一坨。统一交给 flex gap 管，
+   再把各块自带的 margin 归零，免得和 gap 叠出忽宽忽窄的间距。 */
+.stlp-pricing-section {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.stlp-pricing-section > .stlp-pricing-sync-notice {
+    margin-bottom: 0;
+}
+
 .stlp-pricing-model-list {
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: 6px;
+}
+
+/* 组内 6px、组与组（以及独立条目）之间 16px：节奏本身也参与说明分组，不全指望缩进。
+   分块的起点有两种——组头，以及不属于任何组的卡片——给它们补 10px 正好凑成 16。
+   第一个元素不补，免得和这一节的 gap 叠起来。 */
+.stlp-pricing-group-head:not(:first-child),
+.stlp-pricing-model-card:not(.stlp-pricing-model-card-grouped):not(:first-child) {
     margin-top: 10px;
 }
 
@@ -2241,7 +2261,7 @@ body.stlp-page-host-open {
 .stlp-pricing-model-chevron {
     flex: 0 0 auto;
     font-size: 14px;
-    color: var(--stlp-muted);
+    color: var(--stlp-muted-text);
     transition: transform 0.16s ease;
 }
 
@@ -2299,12 +2319,44 @@ body.stlp-page-host-open {
 }
 
 .stlp-pricing-model-note {
-    color: var(--stlp-muted);
+    color: var(--stlp-muted-text);
     line-height: 1.5;
     word-break: break-word;
 }
 
 .stlp-pricing-local-only {
+    color: var(--stlp-highlight-warn-text);
+    font-weight: 600;
+}
+
+/* 前缀变体分组。组头是一行说明而不是可点的卡片，所以刻意做得比卡片轻，
+   免得看着像多了一个能展开的条目。 */
+.stlp-pricing-group-head {
+    display: flex;
+    flex-direction: column;
+    padding: 0 14px 2px;
+}
+
+/* 变体往里缩一格并挂一条竖线。只靠缩进的话，在窄屏上几乎看不出从属关系，
+   而看不出从属关系正是这次要解决的问题本身。 */
+.stlp-pricing-model-card-variant {
+    margin-left: 14px;
+    border-left: 2px solid var(--stlp-border-soft);
+}
+
+.stlp-pricing-group-note {
+    color: var(--stlp-muted-text);
+    line-height: 1.5;
+    word-break: break-word;
+    padding: 8px 10px;
+    margin-bottom: 10px;
+    border-radius: 8px;
+    background: var(--stlp-surface-2);
+}
+
+/* 折叠标题上的短标。用告警色是因为它多半意味着配错了，但给付费档单独定价也是正当用法，
+   所以只染字不铺底，不至于喊得太凶——到底哪种，正文里那句话会说清楚。 */
+.stlp-pricing-group-shadow {
     color: var(--stlp-highlight-warn-text);
     font-weight: 600;
 }
@@ -2409,7 +2461,7 @@ body.stlp-page-host-open {
     border-radius: 999px;
     border: 1px solid var(--stlp-border-soft);
     background: var(--stlp-field-bg);
-    color: var(--stlp-muted);
+    color: var(--stlp-muted-text);
     font-size: 12px;
     font-weight: 600;
     line-height: 1.2;
