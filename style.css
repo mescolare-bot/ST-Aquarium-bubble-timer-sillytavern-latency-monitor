@@ -2338,10 +2338,16 @@ body.stlp-page-host-open {
 }
 
 /* 变体往里缩一格并挂一条竖线。只靠缩进的话，在窄屏上几乎看不出从属关系，
-   而看不出从属关系正是这次要解决的问题本身。 */
+   而看不出从属关系正是这次要解决的问题本身。
+   
+   这条线必须用强调色、而且左侧圆角要归零。初版写的是 2px 的 --stlp-border-soft，
+   和卡片自己那圈 1px 边框同色同形，等于只把左边加粗了 1px——实际效果是完全看不见，
+   用户看到的只有「一张卡莫名其妙窄了一截」，反而比不缩进更费解。 */
 .stlp-pricing-model-card-variant {
     margin-left: 14px;
-    border-left: 2px solid var(--stlp-border-soft);
+    border-left: 3px solid var(--stlp-primary);
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
 }
 
 .stlp-pricing-group-note {
