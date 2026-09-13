@@ -1011,7 +1011,10 @@ body.stlp-page-host-open {
     padding-left: 20px;
 }
 
-.stlp-empty-alert code {
+/* .stlp-note 里也会出现行内代码，而 stream_options.include_usage 这种没有空格的长串
+   在酒馆全局的 code 样式下不换行，会直接撑破面板。两处共用同一份定义。 */
+.stlp-empty-alert code,
+.stlp-note code {
     padding: 1px 5px;
     border-radius: 4px;
     background: rgba(127, 127, 127, 0.22);
