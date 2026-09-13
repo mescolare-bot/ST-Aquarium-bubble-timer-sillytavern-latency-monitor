@@ -196,7 +196,10 @@ export function buildPromptMarkerSnapshot({ messages, promptTrace, promptMarkers
 
 export function normalizeRule(rule) {
     const pluginLabel = normalizeOptionalText(rule?.plugin_label);
-    const pluginId = slugifyPluginId(rule?.plugin_id || pluginLabel) || UNKNOWN_PLUGIN_ID;
+    // 占位 id 视同没有：slugify 只保留 a-z0-9 的那阵子，纯中文名被剥成空串存下了占位 id，
+    // 而占位 id 再 slugify 还是它自己，直接传进去的话永远轮不到 label，老规则自己把自己锁死。
+    const storedPluginId = isUnknownPluginId(rule?.plugin_id) ? '' : rule?.plugin_id;
+    const pluginId = slugifyPluginId(storedPluginId || pluginLabel) || UNKNOWN_PLUGIN_ID;
     const promptMarkers = normalizeStringArray(rule?.prompt_markers, 12);
     const promptTraceKeys = normalizeStringArray(rule?.prompt_trace_keys, 12);
     const sampleRunIds = normalizeRunIdArray(rule?.sample_run_ids);
