@@ -606,9 +606,14 @@ export function createGenerationMonitor(request) {
         }
 
         // 设置由这里读、传进去算：buildAbnormalDetail 本身不碰 I/O，前端形态才能复用同一份逻辑。
-        run.abnormal_detail = buildAbnormalDetail(run, await readMonitorSettingsWithFallback());
+        const settings = await readMonitorSettingsWithFallback();
+        run.abnormal_detail = buildAbnormalDetail(run, settings);
 
-        await appendRun(run);
+        // 读不出设置时按"开着"处理：采集是这个插件的全部意义，
+        // 因为读配置失败就静默停掉，用户只会看到记录莫名其妙断了一段。
+        if (settings?.runtime?.recording_enabled !== false) {
+            await appendRun(run);
+        }
     }
 
     return {

@@ -6560,9 +6560,14 @@ function recordLiteGeneration(effectiveInit, responsePromise) {
                 recorder.markLiteRunError(run, error);
             }
 
-            recorder.finalizeLiteRun(run, await api.readLiteSettings());
+            const liteSettings = await api.readLiteSettings();
+            recorder.finalizeLiteRun(run, liteSettings);
             recordUsageInjectionOutcome(requestBody, run);
-            await store.appendRun(run);
+
+            // 和完整版同口径：读不出设置时按"开着"处理，不因为读配置失败就静默停掉采集。
+            if (liteSettings?.runtime?.recording_enabled !== false) {
+                await store.appendRun(run);
+            }
         } catch (error) {
             console.warn(`[${MODULE_NAME}] 本地记录这次生成失败`, error);
         } finally {
@@ -7547,6 +7552,20 @@ function describePricingGroupNote(unit) {
         : `同组只有这条配了价格，另外 ${unit.groupSize - 1} 条算不出金额。把价格填到 ${baseName} 上，整组就都有了。`;
 }
 
+// 关掉采集之后不挂这条，用户只会看到记录停在某一刻，然后来问插件是不是坏了。
+function buildRecordingPausedBannerHtml() {
+    if (state.settings?.runtime?.recording_enabled !== false) {
+        return "";
+    }
+
+    return `
+        <div class="stlp-recording-paused-banner" role="status">
+            <span>记录已暂停，这期间的生成不会被记下。已有记录不受影响。</span>
+            <button class="menu_button stlp-inline-button" type="button" data-action="resume-recording">恢复记录</button>
+        </div>
+    `;
+}
+
 function buildSettingsContentHtml() {
     const displaySettings = state.settings?.display ?? {};
     const runtimeSettings = state.settings?.runtime ?? {};
@@ -7567,8 +7586,14 @@ function buildSettingsContentHtml() {
                 <button id="stlp_clear_runs" class="menu_button stlp-settings-action-button stlp-settings-action-button-danger" type="button">清空后台</button>
             </div>
     `;
+    const recordingEnabled = runtimeSettings.recording_enabled !== false;
     const runtimeContent = `
             <div class="stlp-controls">
+                <label class="checkbox_label stlp-settings-toggle">
+                    <input id="stlp_recording_enabled" type="checkbox" ${recordingEnabled ? "checked" : ""} ${state.isSaving ? "disabled" : ""} />
+                    <span>记录本次及之后的生成</span>
+                </label>
+                <div class="stlp-note">关掉之后不再新增任何记录，已经记下的原样保留，照常查看、统计、导出、删除。记录只存在${state.recordSourceMode === "lite" ? "你这个浏览器里" : "你自己这台服务器上"}，不会发给任何第三方。注意：关掉的是记录，不是拦截——插件仍然会在生成请求上补 <code>stream_options.include_usage</code> 以便拿到 token 用量，这一点要等你刷新页面才会停。</div>
                 <label class="checkbox_label stlp-settings-toggle">
                     <input id="stlp_show_abnormal_optimization_suggestions" type="checkbox" ${displaySettings.show_abnormal_optimization_suggestions ? "checked" : ""} ${state.isSaving ? "disabled" : ""} />
                     <span>显示异常优化建议</span>
@@ -9048,6 +9073,7 @@ function buildPageHtml() {
                     </button>
                 </div>
             </div>
+            ${buildRecordingPausedBannerHtml()}
             <div class="stlp-page-body">
                 <nav class="stlp-side-nav" aria-label="监控入口">
                     <button class="stlp-side-nav-item ${monitorViewActive && !isExtensionRequestView() ? "is-active" : ""}" type="button" data-nav-purpose="chat_main_reply" aria-pressed="${escapeHtml(String(monitorViewActive && !isExtensionRequestView()))}" title="正文回复" aria-label="正文回复">
@@ -9399,6 +9425,15 @@ function handlePanelChangeTarget(target) {
         updateMonitorSettings({
             display: {
                 show_permission_enhanced_suggestions: Boolean(target.checked),
+            },
+        }, { deferBusyRender: true, optimistic: true });
+        return true;
+    }
+
+    if (target.id === "stlp_recording_enabled") {
+        updateMonitorSettings({
+            runtime: {
+                recording_enabled: Boolean(target.checked),
             },
         }, { deferBusyRender: true, optimistic: true });
         return true;
@@ -9953,6 +9988,15 @@ function handlePanelAction(actionTarget, event) {
         void setPluginRuleEnabled(ruleId, action === "enable-plugin-rule").catch((error) => {
             openMessageDialog("规则操作失败", error instanceof Error ? error.message : String(error));
         });
+        return true;
+    }
+
+    if (action === "resume-recording") {
+        updateMonitorSettings({
+            runtime: {
+                recording_enabled: true,
+            },
+        }, { deferBusyRender: true, optimistic: true });
         return true;
     }
 

@@ -22,6 +22,9 @@ export const PRICING_DISPLAY_CURRENCIES = [
 export const monitorSettingsDefaults = {
     runtime: {
         runtime_mode: 'auto',
+        // 默认开：不记录的话这个插件没有任何用处。关掉之后不再新增记录，
+        // 已有记录原样保留。读不出设置时按 true 处理，见 latency-monitor.js 的兜底。
+        recording_enabled: true,
         // 默认关：诊断记录落在本机磁盘上，只有排查一键终止时才需要，平时开着没有收益。
         collect_force_stop_diagnostics: false,
     },

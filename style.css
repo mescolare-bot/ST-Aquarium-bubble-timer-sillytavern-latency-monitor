@@ -337,6 +337,17 @@ body.stlp-page-host-open {
     touch-action: none;
 }
 
+.stlp-recording-paused-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--stlp-border-soft);
+    background: color-mix(in srgb, var(--stlp-primary) 12%, var(--stlp-surface-1));
+    font-size: var(--stlp-font-body);
+}
+
 .stlp-page-header:active {
     cursor: grabbing;
 }
