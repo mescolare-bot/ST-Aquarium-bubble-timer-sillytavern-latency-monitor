@@ -7411,6 +7411,7 @@ function buildPluginRuleCardHtml(rule) {
                 </div>
                 <div class="stlp-waiting-helper">继续在等待区把同类记录标成同一个拓展名时，系统会自动把新样本补进这条规则，不需要你手动改规则。</div>
                 <div class="stlp-waiting-rule-danger-actions">
+                    <button class="menu_button stlp-waiting-rule-action-button stlp-waiting-rule-action-button-secondary" type="button" data-action="reapply-plugin-rule" data-rule-id="${escapeHtml(ruleId)}">重新应用</button>
                     <button class="menu_button stlp-waiting-rule-action-button stlp-waiting-rule-action-button-secondary" type="button" data-action="request-remove-plugin-rule" data-rule-id="${escapeHtml(ruleId)}">删除规则</button>
                 </div>
             </div>
@@ -9950,6 +9951,18 @@ function handlePanelAction(actionTarget, event) {
         }
 
         void setPluginRuleEnabled(ruleId, action === "enable-plugin-rule").catch((error) => {
+            openMessageDialog("规则操作失败", error instanceof Error ? error.message : String(error));
+        });
+        return true;
+    }
+
+    if (action === "reapply-plugin-rule") {
+        const ruleId = typeof actionTarget?.dataset.ruleId === "string" ? actionTarget.dataset.ruleId.trim() : "";
+        if (!ruleId) {
+            return true;
+        }
+
+        void reapplyPluginRule(ruleId).catch((error) => {
             openMessageDialog("规则操作失败", error instanceof Error ? error.message : String(error));
         });
         return true;

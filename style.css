@@ -3091,6 +3091,7 @@ body.stlp-page-host-open {
 .stlp-waiting-rule-danger-actions {
     display: flex;
     justify-content: flex-end;
+    gap: 8px;
     margin-top: 12px;
 }
 
