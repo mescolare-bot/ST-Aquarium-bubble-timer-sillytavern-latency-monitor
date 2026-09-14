@@ -348,6 +348,19 @@ body.stlp-page-host-open {
     font-size: var(--stlp-font-body);
 }
 
+/* 骨架照抄上面那条"记录已暂停"，只把配色换成危险色，四个主题的危险色变量都已经定义好了。 */
+.stlp-main-api-error-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--stlp-highlight-danger-strong-border);
+    background: var(--stlp-highlight-danger-bg);
+    color: var(--stlp-highlight-danger-text);
+    font-size: var(--stlp-font-body);
+}
+
 .stlp-page-header:active {
     cursor: grabbing;
 }
@@ -486,6 +499,13 @@ body.stlp-page-host-open {
 /* 红色是唯一的例外，它是故障信号，不能被配色盖掉。 */
 .stlp-minimized-button.stlp-status-disconnected {
     color: #ff6b6b;
+}
+
+/* 主 API 出错的红要压过后台状态色和用户自己选的主色，所以放在这些规则之后、并且带 !important
+   （基础规则那条 border 也是 !important，不加抢不过）。同理它是故障信号，不归配色管。 */
+.stlp-minimized-button.is-api-error {
+    color: var(--stlp-highlight-danger-strong-text) !important;
+    border-color: var(--stlp-highlight-danger-strong-border) !important;
 }
 
 .stlp-minimized-button:hover {
@@ -4007,6 +4027,13 @@ body.stlp-page-host-open {
 .stlp-page-host.stlp-page-open.stlp-layout-mobile,
 .stlp-page-host.stlp-page-minimized.stlp-layout-mobile {
     pointer-events: none;
+}
+
+/* 最小化态整块 host 只有那颗星星，没有任何需要平移的内容，这里明确关掉平移手势。
+   这是加固，不是根治：拖动被掐断的成因还没定论（见 design-android-drag-cancel.local.md）。
+   注意不能挂到展开态上——touch-action 沿祖先取交集，加上去面板内部就滚不动了。 */
+.stlp-page-host.stlp-page-minimized {
+    touch-action: none;
 }
 
 .stlp-page-host.stlp-layout-mobile .stlp-page-header,

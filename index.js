@@ -13,6 +13,8 @@ const GENERATION_RECOVERY_WINDOW_MS = 15000;
 const MINIMIZED_BUTTON_MARGIN = 18;
 const MINIMIZED_BUTTON_SIZE = 34;
 const MINIMIZED_BUTTON_DRAG_THRESHOLD = 4;
+const MINIMIZED_BUTTON_TOUCH_FALLBACK_IDLE_MS = 3000;
+const MAIN_API_MANUAL_STOP_GRACE_MS = 1500;
 const MOBILE_OPEN_GUARD_MS = 360;
 const WAITING_QUEUE_EDIT_LOCK_MS = 1500;
 const PENDING_INJECTION_SOURCE_TTL_MS = 10000;
@@ -101,6 +103,7 @@ const DEFAULT_UI_SETTINGS = {
     minimizedButtonOpacity: 1,
     minimizedButtonBackgroundMode: "mist",
     minimizedButtonPosition: null,
+    mainApiErrorIndicatorEnabled: true,
     runFloorMap: {},
     runChatMap: {},
     runChatMapRevision: RUN_CHAT_MAP_REVISION,
@@ -437,6 +440,8 @@ const state = {
     minimizedButtonSuppressClickUntil: 0,
     minimizedButtonLongPressTimerId: null,
     minimizedButtonLongPressTriggered: false,
+    minimizedButtonTouchFallback: null,
+    minimizedButtonTouchFallbackTimerId: null,
     chatUiObserver: null,
     chatUiNormalizeScheduled: false,
     historyDialogOpen: false,
@@ -475,6 +480,8 @@ const state = {
     expandedSuggestionRunIds: new Set(),
     minimizedButtonFlashActive: false,
     minimizedButtonFlashTimerId: null,
+    mainApiErrorActive: false,
+    recentManualStopAtMs: 0,
     minimizedButtonAlertPending: false,
     pendingGenerationIntervention: null,
     lastDismissedGenerationInterventionKey: "",
@@ -527,6 +534,7 @@ function loadUiSettings() {
             minimizedButtonOpacity: normalizeMinimizedButtonOpacity(parsed?.minimizedButtonOpacity),
             minimizedButtonBackgroundMode: normalizeMinimizedButtonBackgroundMode(parsed?.minimizedButtonBackgroundMode),
             minimizedButtonPosition: normalizeMinimizedButtonPosition(parsed?.minimizedButtonPosition),
+            mainApiErrorIndicatorEnabled: normalizeMainApiErrorIndicatorEnabled(parsed?.mainApiErrorIndicatorEnabled),
             runFloorMap: parsed?.runFloorMap && typeof parsed.runFloorMap === "object" ? parsed.runFloorMap : {},
             runChatMap: shouldResetRunChatMap ? {} : (parsed?.runChatMap && typeof parsed.runChatMap === "object" ? parsed.runChatMap : {}),
             runChatMapRevision: RUN_CHAT_MAP_REVISION,
@@ -720,6 +728,16 @@ function normalizeMinimizedButtonBorderColor(value) {
     return normalizeHexColor(value, DEFAULT_UI_SETTINGS.minimizedButtonBorderColor);
 }
 
+function normalizeMainApiErrorIndicatorEnabled(value) {
+    return value === undefined || value === null
+        ? DEFAULT_UI_SETTINGS.mainApiErrorIndicatorEnabled
+        : Boolean(value);
+}
+
+function isMainApiErrorIndicatorEnabled() {
+    return normalizeMainApiErrorIndicatorEnabled(state.uiSettings.mainApiErrorIndicatorEnabled);
+}
+
 // 只有明确存成 false 才算关掉：老配置里没有这个键，此时该沿用"有外圈"的既有外观。
 function normalizeMinimizedButtonBorderVisible(value) {
     return value === undefined || value === null
@@ -825,6 +843,52 @@ function triggerMinimizedButtonFlash() {
         state.minimizedButtonFlashTimerId = null;
         safeRenderPage();
     }, 1500);
+}
+
+// 变红/复原都只走这一个入口，成功和失败两条路必须对称，否则会留下清不掉的红。
+// 判定只在客户端拦截点做，不查 /runs：这样"仅主 API"这个限定是免费的（能走到这里的请求
+// 已经被 shouldTrackAbortableChatGenerationRequest 筛过），也没有轮询延迟。
+function settleMainApiOutcome(success) {
+    if (success) {
+        clearMainApiError();
+        return;
+    }
+
+    markMainApiError();
+}
+
+function markMainApiError() {
+    // 用户自己点停止时 fetch 也会以失败收场，那不算 API 出错。这个时间窗是启发式的，
+    // 和服务端那套 client_stopped 判定一样存在竞态，不追求 100% 精确——判错了最多这次颜色不准。
+    if (Date.now() - state.recentManualStopAtMs < MAIN_API_MANUAL_STOP_GRACE_MS) {
+        return;
+    }
+
+    if (state.mainApiErrorActive) {
+        return;
+    }
+
+    state.mainApiErrorActive = true;
+    if (!isMainApiErrorIndicatorEnabled()) {
+        return;
+    }
+
+    // 最小化时闪一下顺便把渲染带上；面板开着的时候星星根本不在画面里，走横幅。
+    if (state.pageMinimized) {
+        triggerMinimizedButtonFlash();
+        return;
+    }
+
+    safeRenderPage();
+}
+
+function clearMainApiError() {
+    if (!state.mainApiErrorActive) {
+        return;
+    }
+
+    state.mainApiErrorActive = false;
+    safeRenderPage();
 }
 
 function isVisibleElement(element) {
@@ -1137,6 +1201,10 @@ function buildTrackedGenerationRequestInit(input, init, patchedInit, entry) {
 function monitorGenerationResponseLifecycle(response, requestId) {
     if (!(response instanceof Response) || typeof response.clone !== "function") {
         removeActiveGenerationRequest(requestId);
+        // 连响应对象都不是就无从判断这次是不是善终，维持现有颜色不动。
+        if (response instanceof Response) {
+            settleMainApiOutcome(response.ok);
+        }
         return;
     }
 
@@ -1145,15 +1213,21 @@ function monitorGenerationResponseLifecycle(response, requestId) {
         clonedResponse = response.clone();
     } catch {
         removeActiveGenerationRequest(requestId);
+        settleMainApiOutcome(response.ok);
         return;
     }
 
     if (!clonedResponse.body || typeof clonedResponse.body.getReader !== "function") {
         removeActiveGenerationRequest(requestId);
+        settleMainApiOutcome(clonedResponse.ok);
         return;
     }
 
     const reader = clonedResponse.body.getReader();
+    // 这个克隆流读到 done 才算这次请求真的善终。中途抛错就是"断流/生成不完整"那一类——
+    // 服务端区分这两种异常用的也是同一个信号（stream_completed 为假），我们只要"红不红"，
+    // 所以不复刻它的分类。
+    let streamFailed = false;
     void (async () => {
         try {
             while (true) {
@@ -1163,7 +1237,7 @@ function monitorGenerationResponseLifecycle(response, requestId) {
                 }
             }
         } catch {
-            // Ignore stream teardown here; we only use this clone to know when the request fully settles.
+            streamFailed = true;
         } finally {
             try {
                 reader.releaseLock();
@@ -1171,6 +1245,7 @@ function monitorGenerationResponseLifecycle(response, requestId) {
                 // Ignore release failures during teardown.
             }
             removeActiveGenerationRequest(requestId);
+            settleMainApiOutcome(!streamFailed && clonedResponse.ok);
         }
     })();
 }
@@ -2423,6 +2498,8 @@ function minimizePage() {
 }
 
 function restoreMinimizedPage() {
+    // 把面板从星星恢复成打开状态，本身就算"这条提醒你看到了"，不要求那张失败卡片真滚到眼前。
+    state.mainApiErrorActive = false;
     if (!state.pageOpen) {
         openMonitorPage();
         return;
@@ -2445,11 +2522,15 @@ function saveUiSettings() {
     }
 }
 
-function clampMinimizedButtonPosition(position, rect = {}) {
+function clampMinimizedButtonPosition(position, rect = {}, viewport = null) {
     const width = Number(rect.width) || MINIMIZED_BUTTON_SIZE;
     const height = Number(rect.height) || MINIMIZED_BUTTON_SIZE;
-    const maxLeft = Math.max(MINIMIZED_BUTTON_MARGIN, window.innerWidth - MINIMIZED_BUTTON_MARGIN - width);
-    const maxTop = Math.max(MINIMIZED_BUTTON_MARGIN, window.innerHeight - MINIMIZED_BUTTON_MARGIN - height);
+    // 视口尺寸允许调用方传进来：读 window.innerWidth/innerHeight 会强制浏览器把待处理的
+    // 样式改动刷成布局，拖动时每帧读一次就是每帧一次全文档布局，安卓上这笔开销很可观。
+    const viewportWidth = Number(viewport?.width) || window.innerWidth;
+    const viewportHeight = Number(viewport?.height) || window.innerHeight;
+    const maxLeft = Math.max(MINIMIZED_BUTTON_MARGIN, viewportWidth - MINIMIZED_BUTTON_MARGIN - width);
+    const maxTop = Math.max(MINIMIZED_BUTTON_MARGIN, viewportHeight - MINIMIZED_BUTTON_MARGIN - height);
 
     // 这里不能用 `|| maxLeft` 兜底：坐标恰好是 0 时会走 falsy 分支被当成"没给值"，
     // 按钮从左边缘瞬间弹到右边缘。只有真的不是数字才该退回默认位置。
@@ -5449,8 +5530,16 @@ function startMinimizedButtonDrag(event) {
         return;
     }
 
+    detachMinimizedButtonTouchFallback();
+    // 报警闪烁的关键帧里带 transform，而 CSS 动画优先级高于内联样式——它会把拖动的位移整条盖掉，
+    // 星星原地抖到动画结束（拖动期间渲染是挂起的，那个 1.5 秒定时器还清不掉这个类）。
+    // 手已经摸到星星上了，这条提醒的目的本来就达到了，直接收掉。
+    clearMinimizedButtonFlashTimer();
+    state.minimizedButtonFlashActive = false;
+    button.classList.remove("is-alert-flashing");
     event.preventDefault();
     const rect = button.getBoundingClientRect();
+    const viewport = { width: window.innerWidth, height: window.innerHeight };
     state.minimizedButtonDrag = {
         pointerId: event.pointerId,
         startX: event.clientX,
@@ -5459,13 +5548,20 @@ function startMinimizedButtonDrag(event) {
         offsetY: event.clientY - rect.top,
         width: rect.width,
         height: rect.height,
+        // 视口尺寸和按钮节点在起手时各取一次：拖动期间两者都不会变，
+        // 移动处理因此不必再读 window、也不必再查 DOM。
+        viewport,
+        button,
+        // 拖动期间的位移写在 transform 上，这两个值是它的原点。
+        baseLeft: rect.left,
+        baseTop: rect.top,
         moved: false,
     };
     state.minimizedButtonLongPressTriggered = false;
     state.uiSettings.minimizedButtonPosition = clampMinimizedButtonPosition({
         left: rect.left,
         top: rect.top,
-    }, rect);
+    }, rect, viewport);
 
     clearMinimizedButtonLongPressTimer();
 }
@@ -5475,39 +5571,66 @@ function handleMinimizedButtonDragMove(event) {
         return;
     }
 
+    event.preventDefault();
+    moveMinimizedButtonDragTo(event.clientX, event.clientY);
+}
+
+function resolveMinimizedButtonDragNode(drag) {
+    if (drag.button instanceof HTMLElement && drag.button.isConnected) {
+        return drag.button;
+    }
+
+    // 拖动期间 safeRenderPage 是挂起的，节点本来不该被换掉。这里是兜底：真被换了就重新取，
+    // 并把 transform 的原点重新量准，否则位移会从错误的起点算起。
     const button = state.pageRoot?.querySelector(".stlp-minimized-button");
     if (!(button instanceof HTMLElement)) {
+        return null;
+    }
+
+    const rect = button.getBoundingClientRect();
+    drag.button = button;
+    drag.baseLeft = rect.left;
+    drag.baseTop = rect.top;
+    return button;
+}
+
+// 坐标从指针事件还是从触摸事件来都走这里：手势被接管后只剩 touchmove 能用（见
+// handleMinimizedButtonDragCancel），两条通道必须算出完全一样的位置。
+function moveMinimizedButtonDragTo(clientX, clientY) {
+    const drag = state.minimizedButtonDrag;
+    if (!drag || state.minimizedButtonLongPressTriggered) {
         return;
     }
 
-    event.preventDefault();
-    if (state.minimizedButtonLongPressTriggered) {
+    const button = resolveMinimizedButtonDragNode(drag);
+    if (!button) {
         return;
     }
 
-    const deltaX = event.clientX - state.minimizedButtonDrag.startX;
-    const deltaY = event.clientY - state.minimizedButtonDrag.startY;
+    const deltaX = clientX - drag.startX;
+    const deltaY = clientY - drag.startY;
     if (Math.abs(deltaX) >= MINIMIZED_BUTTON_DRAG_THRESHOLD || Math.abs(deltaY) >= MINIMIZED_BUTTON_DRAG_THRESHOLD) {
         clearMinimizedButtonLongPressTimer();
-        state.minimizedButtonDrag.moved = true;
+        drag.moved = true;
         button.classList.add("is-dragging");
-    } else if (!state.minimizedButtonDrag.moved) {
+    } else if (!drag.moved) {
         return;
     }
 
     const position = clampMinimizedButtonPosition({
-        left: event.clientX - state.minimizedButtonDrag.offsetX,
-        top: event.clientY - state.minimizedButtonDrag.offsetY,
+        left: clientX - drag.offsetX,
+        top: clientY - drag.offsetY,
     }, {
-        width: state.minimizedButtonDrag.width,
-        height: state.minimizedButtonDrag.height,
-    });
+        width: drag.width,
+        height: drag.height,
+    }, drag.viewport);
 
     state.uiSettings.minimizedButtonPosition = position;
-    button.style.left = `${position.left}px`;
-    button.style.top = `${position.top}px`;
-    button.style.right = "auto";
-    button.style.bottom = "auto";
+    // 拖动期间只动 transform、不动 left/top：布局盒子留在原地，浏览器每帧不用重新布局整个文档。
+    // 不用 translate3d、也不加 will-change——这个拓展有过前科：filter 把按钮提升到独立 GPU
+    // 合成层之后，部分安卓机上星星直接不显示，最后靠 style.css 里那条 filter: none 修掉的。
+    // scale 得自己带上：内联 transform 会把 .is-dragging 那条整体盖掉。
+    button.style.transform = `translate(${position.left - drag.baseLeft}px, ${position.top - drag.baseTop}px) scale(0.98)`;
 }
 
 function startPageDrag(event) {
@@ -5625,16 +5748,122 @@ function endMinimizedButtonDrag(event) {
         return;
     }
 
-    clearMinimizedButtonLongPressTimer();
-    const button = state.pageRoot?.querySelector(".stlp-minimized-button");
-    if (button instanceof HTMLElement) {
-        button.classList.remove("is-dragging");
+    finishMinimizedButtonDrag();
+}
+
+// 浏览器或系统把手势接管走时会发 pointercancel，之后一个 pointermove 都不再发，拖动就断在那里
+// ——安卓用户反馈的"拖一小段就得重新拖"正是这个。但 touchmove 仍在派发（它就是驱动滚动的
+// 那个事件），所以这里不结束拖动，改从触摸事件继续取坐标。具体是谁抢走手势还没定论，见
+// design-android-drag-cancel.local.md；这条通道不依赖成因，抢手势的是谁都能兜住。
+function handleMinimizedButtonDragCancel(event) {
+    const drag = state.minimizedButtonDrag;
+    if (!drag || (event && event.pointerId !== drag.pointerId)) {
+        return;
     }
 
-    if (state.minimizedButtonDrag.moved || state.minimizedButtonLongPressTriggered) {
+    if (event?.pointerType !== "mouse" && attachMinimizedButtonTouchFallback()) {
+        return;
+    }
+
+    finishMinimizedButtonDrag();
+}
+
+function attachMinimizedButtonTouchFallback() {
+    if (state.minimizedButtonTouchFallback) {
+        return true;
+    }
+
+    if (!("ontouchstart" in window)) {
+        return false;
+    }
+
+    const handleTouchMove = (event) => {
+        runSafely("处理兜底拖动移动", () => {
+            // 多指的情况不去分辨：能走到这条通道说明手势已经被别人接管，
+            // 此时还有第二根手指按着的场景不值得为它加一套 identifier 跟踪。
+            const touch = event.touches?.[0] || event.changedTouches?.[0];
+            if (!touch) {
+                return;
+            }
+
+            refreshMinimizedButtonTouchFallbackTimer();
+            moveMinimizedButtonDragTo(touch.clientX, touch.clientY);
+        });
+    };
+    const handleTouchEnd = () => {
+        runSafely("处理兜底拖动结束", () => {
+            finishMinimizedButtonDrag();
+        });
+    };
+
+    state.minimizedButtonTouchFallback = { handleTouchMove, handleTouchEnd };
+    // 只读坐标、不拦截：手势已经被接管，再 preventDefault 也抢不回来，passive 还能少阻塞一次主线程。
+    document.addEventListener("touchmove", handleTouchMove, { passive: true });
+    document.addEventListener("touchend", handleTouchEnd);
+    document.addEventListener("touchcancel", handleTouchEnd);
+    refreshMinimizedButtonTouchFallbackTimer();
+    return true;
+}
+
+function refreshMinimizedButtonTouchFallbackTimer() {
+    if (state.minimizedButtonTouchFallbackTimerId) {
+        clearTimeout(state.minimizedButtonTouchFallbackTimerId);
+    }
+
+    // 兜底通道靠 touchend 收尾。万一连 touchend 也被吞掉，拖动状态会一直挂着，
+    // 而 safeRenderPage 在拖动期间是挂起的——整个面板就停更了。所以留一道静默超时。
+    state.minimizedButtonTouchFallbackTimerId = window.setTimeout(() => {
+        runSafely("兜底拖动静默超时收尾", () => {
+            finishMinimizedButtonDrag();
+        });
+    }, MINIMIZED_BUTTON_TOUCH_FALLBACK_IDLE_MS);
+}
+
+function detachMinimizedButtonTouchFallback() {
+    if (state.minimizedButtonTouchFallbackTimerId) {
+        clearTimeout(state.minimizedButtonTouchFallbackTimerId);
+        state.minimizedButtonTouchFallbackTimerId = null;
+    }
+
+    const fallback = state.minimizedButtonTouchFallback;
+    if (!fallback) {
+        return;
+    }
+
+    document.removeEventListener("touchmove", fallback.handleTouchMove);
+    document.removeEventListener("touchend", fallback.handleTouchEnd);
+    document.removeEventListener("touchcancel", fallback.handleTouchEnd);
+    state.minimizedButtonTouchFallback = null;
+}
+
+function finishMinimizedButtonDrag() {
+    const drag = state.minimizedButtonDrag;
+    if (!drag) {
+        return;
+    }
+
+    clearMinimizedButtonLongPressTimer();
+    detachMinimizedButtonTouchFallback();
+    const button = drag.button instanceof HTMLElement && drag.button.isConnected
+        ? drag.button
+        : state.pageRoot?.querySelector(".stlp-minimized-button");
+    if (button instanceof HTMLElement) {
+        button.classList.remove("is-dragging");
+        // transform 只是拖动期间的临时位移，抬手时结算成 left/top 再清掉。
+        // 两步在同一个任务里做完，中间不会有一帧画在旧位置上。
+        if (drag.moved && state.uiSettings.minimizedButtonPosition) {
+            button.style.left = `${state.uiSettings.minimizedButtonPosition.left}px`;
+            button.style.top = `${state.uiSettings.minimizedButtonPosition.top}px`;
+            button.style.right = "auto";
+            button.style.bottom = "auto";
+        }
+        button.style.transform = "";
+    }
+
+    if (drag.moved || state.minimizedButtonLongPressTriggered) {
         state.minimizedButtonSuppressClickUntil = Date.now() + 250;
     }
-    if (state.minimizedButtonDrag.moved) {
+    if (drag.moved) {
         saveUiSettings();
     }
     state.minimizedButtonDrag = null;
@@ -6648,10 +6877,13 @@ function installOutgoingGenerationHook() {
                     return response;
                 }, (error) => {
                     removeActiveGenerationRequest(requestEntry.requestId);
+                    // 网络层直接失败：连响应都没拿到，不可能是善终。
+                    settleMainApiOutcome(false);
                     throw error;
                 });
             } catch (error) {
                 removeActiveGenerationRequest(requestEntry.requestId);
+                settleMainApiOutcome(false);
                 throw error;
             }
         }
@@ -6681,6 +6913,9 @@ function installGenerationSettingsHook() {
         markSillyTavernGenerationStarted();
     });
     eventSource.on(event_types.GENERATION_STOPPED, () => {
+        // 酒馆只在 stopGeneration() 里发这个事件（script.js:5559），API 出错不会走到，
+        // 所以这里和 #mes_stop 的点击一样算"用户自己停的"，那次 fetch 失败不该判成 API 出错。
+        state.recentManualStopAtMs = Date.now();
         // markSillyTavernGenerationStopped 会清空生成 id，信号必须赶在它前面发。
         void sendClientStopSignal();
         markSillyTavernGenerationStopped();
@@ -6698,6 +6933,8 @@ function installGenerationSettingsHook() {
     document.addEventListener("click", (event) => {
         const target = event.target;
         if (target instanceof Element && target.closest("#mes_stop")) {
+            // 记一笔时间：接下来那次 fetch 失败是用户自己停的，不该算成 API 出错。
+            state.recentManualStopAtMs = Date.now();
             void sendClientStopSignal();
         }
     }, true);
@@ -7609,6 +7846,20 @@ function buildRecordingPausedBannerHtml() {
     `;
 }
 
+// 面板开着的时候星星不在画面里，变色没人看得见，所以这条状态在面板里走横幅。
+function buildMainApiErrorBannerHtml() {
+    if (!state.mainApiErrorActive || !isMainApiErrorIndicatorEnabled()) {
+        return "";
+    }
+
+    return `
+        <div class="stlp-main-api-error-banner" role="status">
+            <span>主 API 上一次请求没有正常完成（报错、超时或中途断流），这一条回复可能没收全。</span>
+            <button class="menu_button stlp-inline-button" type="button" data-action="dismiss-main-api-error">知道了</button>
+        </div>
+    `;
+}
+
 function buildSettingsContentHtml() {
     const displaySettings = state.settings?.display ?? {};
     const runtimeSettings = state.settings?.runtime ?? {};
@@ -7891,6 +8142,7 @@ function buildSettingsContentHtml() {
     const minimizedButtonStrokeColor = normalizeMinimizedButtonStrokeColor(state.uiSettings.minimizedButtonStrokeColor);
     const minimizedButtonBorderColor = normalizeMinimizedButtonBorderColor(state.uiSettings.minimizedButtonBorderColor);
     const minimizedButtonBorderVisible = isMinimizedButtonBorderVisible();
+    const mainApiErrorIndicatorEnabled = isMainApiErrorIndicatorEnabled();
     const minimizedButtonOpacityPercent = getMinimizedButtonOpacityPercent();
     const isMinimizedButtonFollowingTheme = minimizedButtonColorMode === "follow_theme";
     const themeSummary = getThemeModeLabel(state.uiSettings.themeMode).replace("主题：", "");
@@ -7927,6 +8179,11 @@ function buildSettingsContentHtml() {
                 <input id="stlp_minimized_button_border_visible" type="checkbox" ${minimizedButtonBorderVisible ? "checked" : ""} />
                 <span>显示图标外圈</span>
             </label>
+            <label class="checkbox_label stlp-settings-toggle">
+                <input id="stlp_main_api_error_indicator_enabled" type="checkbox" ${mainApiErrorIndicatorEnabled ? "checked" : ""} />
+                <span>主 API 出错时提醒</span>
+            </label>
+            <div class="stlp-note">开着的话：主 API 请求报错、超时或中途断流时，收起的星星会变红；面板正开着的时候星星看不见，改在顶部显示一条横幅。你自己点停止不算出错。星星点开面板、或者横幅上点"知道了"，都算确认过，提醒立刻消失；下一次请求正常完成也会自动复原。</div>
             <label class="stlp-color-wheel-field ${minimizedButtonBorderVisible ? "" : "is-disabled"}">
                 <span>外圈边框</span>
                 <div class="stlp-color-wheel-row">
@@ -9068,7 +9325,7 @@ function buildPageHtml() {
     if (state.pageMinimized) {
         return `
             <button
-                class="menu_button stlp-minimized-button ${escapeHtml(getBackendStatusIndicatorClass())} ${state.minimizedButtonFlashActive ? "is-alert-flashing" : ""}"
+                class="menu_button stlp-minimized-button ${escapeHtml(getBackendStatusIndicatorClass())} ${state.minimizedButtonFlashActive ? "is-alert-flashing" : ""} ${state.mainApiErrorActive && isMainApiErrorIndicatorEnabled() ? "is-api-error" : ""}"
                 type="button"
                 data-action="restore-page"
                 title="${escapeHtml(MODULE_DISPLAY_NAME)}"
@@ -9118,6 +9375,7 @@ function buildPageHtml() {
                 </div>
             </div>
             ${buildRecordingPausedBannerHtml()}
+            ${buildMainApiErrorBannerHtml()}
             <div class="stlp-page-body">
                 <nav class="stlp-side-nav" aria-label="监控入口">
                     <button class="stlp-side-nav-item ${monitorViewActive && !isExtensionRequestView() ? "is-active" : ""}" type="button" data-nav-purpose="chat_main_reply" aria-pressed="${escapeHtml(String(monitorViewActive && !isExtensionRequestView()))}" title="正文回复" aria-label="正文回复">
@@ -9564,6 +9822,14 @@ function handlePanelChangeTarget(target) {
 
     if (target.id === "stlp_minimized_button_border_visible") {
         state.uiSettings.minimizedButtonBorderVisible = Boolean(target.checked);
+        saveUiSettings();
+        safeRenderPage();
+        return true;
+    }
+
+    if (target.id === "stlp_main_api_error_indicator_enabled") {
+        // 关掉只是不显示：mainApiErrorActive 照常维护，重新打开立刻能看到当前状态。
+        state.uiSettings.mainApiErrorIndicatorEnabled = Boolean(target.checked);
         saveUiSettings();
         safeRenderPage();
         return true;
@@ -10032,6 +10298,13 @@ function handlePanelAction(actionTarget, event) {
         void setPluginRuleEnabled(ruleId, action === "enable-plugin-rule").catch((error) => {
             openMessageDialog("规则操作失败", error instanceof Error ? error.message : String(error));
         });
+        return true;
+    }
+
+    if (action === "dismiss-main-api-error") {
+        // 点过就算确认过，立刻清掉，不管下一次请求成不成功。
+        state.mainApiErrorActive = false;
+        safeRenderPage();
         return true;
     }
 
@@ -10730,7 +11003,7 @@ function bindUiEvents() {
 
     document.addEventListener("pointercancel", (event) => {
         runSafely("处理拖动取消", () => {
-            endMinimizedButtonDrag(event);
+            handleMinimizedButtonDragCancel(event);
             endPageDrag(event);
             endPageResize(event);
         });
