@@ -433,6 +433,7 @@ const state = {
     bodyScrollLockTop: 0,
     viewportSyncQueued: false,
     minimizedButtonDrag: null,
+    minimizedButtonDragRenderPending: false,
     minimizedButtonSuppressClickUntil: 0,
     minimizedButtonLongPressTimerId: null,
     minimizedButtonLongPressTriggered: false,
@@ -2450,9 +2451,16 @@ function clampMinimizedButtonPosition(position, rect = {}) {
     const maxLeft = Math.max(MINIMIZED_BUTTON_MARGIN, window.innerWidth - MINIMIZED_BUTTON_MARGIN - width);
     const maxTop = Math.max(MINIMIZED_BUTTON_MARGIN, window.innerHeight - MINIMIZED_BUTTON_MARGIN - height);
 
+    // 这里不能用 `|| maxLeft` 兜底：坐标恰好是 0 时会走 falsy 分支被当成"没给值"，
+    // 按钮从左边缘瞬间弹到右边缘。只有真的不是数字才该退回默认位置。
+    const rawLeft = Number(position?.left);
+    const rawTop = Number(position?.top);
+    const left = Number.isFinite(rawLeft) ? rawLeft : maxLeft;
+    const top = Number.isFinite(rawTop) ? rawTop : maxTop;
+
     return {
-        left: Math.round(Math.max(MINIMIZED_BUTTON_MARGIN, Math.min(Number(position?.left) || maxLeft, maxLeft))),
-        top: Math.round(Math.max(MINIMIZED_BUTTON_MARGIN, Math.min(Number(position?.top) || maxTop, maxTop))),
+        left: Math.round(Math.max(MINIMIZED_BUTTON_MARGIN, Math.min(left, maxLeft))),
+        top: Math.round(Math.max(MINIMIZED_BUTTON_MARGIN, Math.min(top, maxTop))),
     };
 }
 
@@ -2539,6 +2547,15 @@ function runSafely(action, callback, fallbackValue = undefined, { disableOnError
 }
 
 function safeRenderPage() {
+    // 拖动期间一律不重渲染：renderPage 整块重写 innerHTML，会把最小化按钮的节点换掉，
+    // 而拖动起手时对旧节点调了 setPointerCapture，节点一消失浏览器就抛 pointercancel，
+    // 手指还没抬起来拖动就断了。实测那个节点几秒内就会被换一次，触屏很容易撞上。
+    // 挂起的渲染在 endMinimizedButtonDrag 里补。
+    if (state.minimizedButtonDrag) {
+        state.minimizedButtonDragRenderPending = true;
+        return;
+    }
+
     runSafely("渲染独立页面", () => {
         renderPage();
     });
@@ -4124,6 +4141,8 @@ function buildPromptVolumeRows(insight) {
         return [];
     }
 
+    // 这里是纯正文字符（collectContentStats 累加原始字符串长度），
+    // 和排障卡的「请求体字符」不是一个数：后者是 JSON.stringify 的长度，含结构和转义，实测多 4% 左右。
     const rows = [
         { label: "消息总数", value: formatCount(insight.totalMessages) },
         { label: "正文字符", value: formatCount(insight.totalChars) },
@@ -5327,7 +5346,10 @@ function syncMobileViewport() {
     }
 
     const dialogs = state.pageRoot.querySelectorAll(".stlp-page-dialog, .stlp-history-dialog");
-    if (!dialogs.length) {
+    // 确认层要单独找：最小化时没有主面板，早退的话底部弹出框就永远贴着布局视口底边，
+    // 而安卓 Chrome 的布局视口底部那一截常常在屏幕之外，按钮因此点不到。
+    const confirmLayers = state.pageRoot.querySelectorAll(".stlp-confirm-layer");
+    if (!dialogs.length && !confirmLayers.length) {
         return;
     }
 
@@ -5354,6 +5376,18 @@ function syncMobileViewport() {
         dialog.style.bottom = "auto";
         dialog.style.height = `${maxHeight}px`;
         dialog.style.maxHeight = `${maxHeight}px`;
+    });
+
+    // 确认层默认是 absolute + inset:0，铺满的是布局视口。把它压到可见视口的范围，
+    // 里面 margin-top:auto 的底部弹出框就会贴到「看得见的」底边而不是布局视口底边。
+    confirmLayers.forEach((layer) => {
+        if (!(layer instanceof HTMLElement)) {
+            return;
+        }
+
+        layer.style.top = `${offsetTop}px`;
+        layer.style.bottom = "auto";
+        layer.style.height = `${viewportHeight}px`;
     });
 }
 
@@ -5605,6 +5639,11 @@ function endMinimizedButtonDrag(event) {
     }
     state.minimizedButtonDrag = null;
     state.minimizedButtonLongPressTriggered = false;
+
+    if (state.minimizedButtonDragRenderPending) {
+        state.minimizedButtonDragRenderPending = false;
+        safeRenderPage();
+    }
 }
 
 function isAbnormalRun(run) {

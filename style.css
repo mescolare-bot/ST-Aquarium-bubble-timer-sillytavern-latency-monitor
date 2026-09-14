@@ -416,14 +416,23 @@ body.stlp-page-host-open {
     --stlp-minimized-icon-size: 28px;
     --stlp-minimized-icon-viewbox: 24;
     --stlp-minimized-star-stroke: 1.4;
+    /* 按钮边长只在这里定义一次：下面的宽高和三处 top 计算都从它取。
+       JS 那边还有一份 MINIMIZED_BUTTON_SIZE（index.js）用于拖动夹取，改这里要一起改。 */
+    --stlp-minimized-size: 34px;
     position: fixed;
     right: calc(18px + env(safe-area-inset-right));
-    bottom: calc(18px + env(safe-area-inset-bottom));
+    /* 纵轴不能用 bottom：酒馆本体给 html 加了 transform（修 Chrome 模糊层闪烁），
+       html 因此成为固定定位的包含块；而 ≤1000px 时酒馆又把 body 设成 fixed，
+       html 塌成 0 高。两者叠加会让 bottom 锚定的元素被推到屏幕上方之外。
+       从顶部按 dvh 反算就不受影响。100vh 那行是给不支持 dvh 的浏览器兜底。 */
+    top: calc(100vh - 18px - env(safe-area-inset-bottom, 0px) - var(--stlp-minimized-size));
+    top: calc(100dvh - 18px - env(safe-area-inset-bottom, 0px) - var(--stlp-minimized-size));
+    bottom: auto;
     z-index: 10001;
-    width: 34px;
-    min-width: 34px;
-    height: 34px;
-    min-height: 34px;
+    width: var(--stlp-minimized-size);
+    min-width: var(--stlp-minimized-size);
+    height: var(--stlp-minimized-size);
+    min-height: var(--stlp-minimized-size);
     padding: 0;
     /* 这三条都要 !important：按钮挂着酒馆的 .menu_button，特异性和这里完全相同，
        只靠后加载抢不稳。酒馆那边给的是 border 深色描边和 filter: grayscale(0.5)，
@@ -4250,18 +4259,22 @@ body.stlp-page-host-open {
     gap: 6px 10px;
 }
 
+/* 84px 而不是 18px：把按钮抬到聊天输入区上方，免得误触发送。 */
 .stlp-page-host.stlp-layout-mobile .stlp-minimized-button {
     right: calc(14px + env(safe-area-inset-right));
-    bottom: calc(84px + env(safe-area-inset-bottom));
+    top: calc(100vh - 84px - env(safe-area-inset-bottom, 0px) - var(--stlp-minimized-size));
+    top: calc(100dvh - 84px - env(safe-area-inset-bottom, 0px) - var(--stlp-minimized-size));
+    bottom: auto;
 }
 
-/* Follow ST-SevenDaysCal's iOS workaround: avoid bottom-anchored fixed FABs.
-   In ST mobile WebKit, html/body fixed stacking can push bottom-fixed items
-   above the visible viewport; anchoring from 100dvh keeps the restore button visible.
-   Lift the initial restore button above the chat send area to avoid accidental taps. */
+/* 这块和上面那条声明完全相同，只是选择器多一个 .stlp-platform-ios、特异性更高。
+   原本是 iOS 专用的 bottom 锚定绕行方案，后来发现安卓同样中招（见
+   design-android-floating-button.local.md），就把它提拔成了所有端的默认。
+   这份留着当保险栓：万一以后有人改坏上面那条，iOS 还有兜底。
+   代价是两处必须同步——改纵轴时记得一起改。 */
 .stlp-page-host.stlp-platform-ios.stlp-layout-mobile .stlp-minimized-button {
-    top: calc(100vh - 84px - env(safe-area-inset-bottom, 0px) - 34px);
-    top: calc(100dvh - 84px - env(safe-area-inset-bottom, 0px) - 34px);
+    top: calc(100vh - 84px - env(safe-area-inset-bottom, 0px) - var(--stlp-minimized-size));
+    top: calc(100dvh - 84px - env(safe-area-inset-bottom, 0px) - var(--stlp-minimized-size));
     bottom: auto;
 }
 
@@ -4587,11 +4600,15 @@ body.stlp-page-host-open {
     min-width: 0;
 }
 
+/* 底部内边距用 max() 兜一个下限：安卓 Chrome 的 env(safe-area-inset-bottom) 基本都是 0，
+   按钮会紧贴视口底边，被系统手势条压住点不到。iOS 真实安全区更大时仍按真实值走。
+   注意这只挡「浏览器视口之外的系统 UI」；可见视口和布局视口不一致那种情况
+   由 syncMobileViewport() 用 visualViewport 处理，两者针对不同成因。 */
 .stlp-page-host.stlp-layout-mobile .stlp-confirm-dialog {
     width: 100%;
     max-width: min(100vw, 720px);
     margin-top: auto;
-    padding: 10px 16px calc(16px + env(safe-area-inset-bottom));
+    padding: 10px 16px max(20px, calc(16px + env(safe-area-inset-bottom)));
     border-radius: 18px 18px 0 0;
     box-shadow: var(--stlp-shadow-strong);
 }
@@ -4600,7 +4617,7 @@ body.stlp-page-host-open {
     width: 100%;
     max-width: min(100vw, 440px);
     margin-top: auto;
-    padding: 10px 12px calc(14px + env(safe-area-inset-bottom));
+    padding: 10px 12px max(20px, calc(14px + env(safe-area-inset-bottom)));
     border-radius: 16px 16px 0 0;
     box-shadow: var(--stlp-shadow-strong);
 }
