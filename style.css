@@ -4407,6 +4407,16 @@ body.stlp-page-host-open {
     justify-content: center;
 }
 
+/* 上面那条把 .stlp-inline-button 拉成整行宽，而它自带 flex-shrink: 0，
+   横幅那种"文字 + 按钮"的横排里按钮既不肯缩又要占满整行，文字就被挤成一列单字、
+   按钮还会溢出到面板外（实测 384px 宽下横幅高 222-257px）。移动端一律改成上下堆叠。 */
+.stlp-page-host.stlp-layout-mobile .stlp-recording-paused-banner,
+.stlp-page-host.stlp-layout-mobile .stlp-main-api-error-banner {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+}
+
 .stlp-page-host.stlp-layout-mobile .stlp-run-summary-no-select {
     grid-template-columns: minmax(0, 1fr);
 }
