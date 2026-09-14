@@ -1079,6 +1079,9 @@ body.stlp-page-host-open {
     border: 1px solid var(--stlp-control-border);
     background: var(--stlp-control-bg);
     color: var(--stlp-control-text);
+    /* 酒馆给 .menu_button 挂了 filter: grayscale(0.5)，既削掉一半主题色饱和度，
+       又把每个按钮提升成独立合成层。这里选择器是 0,2,0，压得过它的 0,1,0，不用 !important。 */
+    filter: none;
     box-shadow: var(--stlp-control-shadow);
     transition: background 0.18s ease, border-color 0.18s ease, color 0.18s ease, box-shadow 0.18s ease;
 }
