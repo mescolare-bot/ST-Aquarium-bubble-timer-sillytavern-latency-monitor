@@ -7854,7 +7854,7 @@ function buildMainApiErrorBannerHtml() {
 
     return `
         <div class="stlp-main-api-error-banner" role="status">
-            <span>主 API 上一次请求没有正常完成（报错、超时或中途断流），这一条回复可能没收全。</span>
+            <span>主 API 上一次请求没有正常完成，详情看排障卡。</span>
             <button class="menu_button stlp-inline-button" type="button" data-action="dismiss-main-api-error">知道了</button>
         </div>
     `;
