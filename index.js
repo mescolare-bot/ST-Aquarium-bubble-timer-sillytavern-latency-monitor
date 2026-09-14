@@ -7666,6 +7666,7 @@ function buildSettingsContentHtml() {
         <div class="stlp-pricing-section">
             <div class="stlp-settings-subtitle">模型价格估算</div>
             <div class="stlp-note">这里会列出后台已经抓到的模型。每个模型都可以单独选择美元或人民币，填写输入 / 缓存输入 / 输出每 100 万 Token 的价格；详情里的估算金额会跟着这个模型自己的单位显示。峰谷计费按本机时间判断，只需要配置峰时段，其余时间会自动按谷时段计算。</div>
+            <div class="stlp-note">费用只按上游返回的 usage 计算。拿不到 usage 的记录不计费，也不会用字符数倒推，所以这里的金额只会偏低、不会偏高。实测这个缺口约 0.1%，但样本来自开发者自用的实例，你那里未必是这个数。</div>
             ${localOnlyPricedModels.size ? `
                 <div class="stlp-pricing-sync-notice">
                     <div>有 ${localOnlyPricedModels.size} 个模型的价格只存在这台浏览器里，没有存到服务器。换设备打开会看不到，清掉浏览器数据就会丢失，异常记录的费用也算不出来。</div>
