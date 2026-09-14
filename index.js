@@ -3877,7 +3877,7 @@ function getRunContextPressureText(run) {
     }
 
     if (charsHeavy) {
-        return "提示词字符偏高";
+        return "请求体字符偏高";
     }
 
     if (messagesHeavy) {
@@ -4126,7 +4126,7 @@ function buildPromptVolumeRows(insight) {
 
     const rows = [
         { label: "消息总数", value: formatCount(insight.totalMessages) },
-        { label: "提示词字符", value: formatCount(insight.totalChars) },
+        { label: "正文字符", value: formatCount(insight.totalChars) },
     ];
 
     for (const row of insight.roleRows) {
@@ -4194,7 +4194,7 @@ function buildOutputCardSectionData(snapshot, fields) {
             { label: "预处理", value: snapshot.preprocessMsText },
             { label: "首个输出", value: snapshot.ttftMsText },
             { label: "消息数", value: snapshot.messageCountText },
-            { label: "提示词字符", value: snapshot.promptCharsText },
+            { label: "请求体字符", value: snapshot.promptCharsText },
             { label: "Prompt", value: snapshot.promptTokensText },
             { label: "Completion", value: snapshot.completionTokensText },
             { label: "Total", value: snapshot.totalTokensText },
@@ -4444,7 +4444,7 @@ function buildOutputCardText(run) {
         `注入痕迹：${snapshot.injectionTraceText}`,
         `拓展名称：${snapshot.pluginLabel}`,
         fields.showContextVolume ? `消息数：${snapshot.messageCountText}` : "",
-        fields.showContextVolume ? `提示词字符数：${snapshot.promptCharsText}` : "",
+        fields.showContextVolume ? `请求体字符数：${snapshot.promptCharsText}` : "",
         fields.showPromptVolume ? `提示词体积结论：${snapshot.promptVolumeConclusionText}` : "",
         fields.showPromptVolume ? `提示词体积构成：${snapshot.promptVolumeCompositionText}` : "",
         fields.showInjectionDetails ? `注入来源名称：${snapshot.injectionSourceLabel}` : "",
@@ -8601,7 +8601,7 @@ function buildRunHtml(run, { compactSummary = false, showWaitingQueueAction = tr
             { label: "首个输出", value: detailSnapshot.ttftMsText },
             { label: "流式输出", value: detailSnapshot.streamMsText },
             { label: "消息数", value: detailSnapshot.messageCountText },
-            { label: "提示词字符", value: detailSnapshot.promptCharsText },
+            { label: "请求体字符", value: detailSnapshot.promptCharsText },
             { label: "Prompt", value: detailSnapshot.promptTokensText },
             { label: "Completion", value: detailSnapshot.completionTokensText },
             { label: "Total", value: detailSnapshot.totalTokensText },
