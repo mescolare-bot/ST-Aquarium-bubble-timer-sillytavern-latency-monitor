@@ -4316,7 +4316,7 @@ body.stlp-page-host-open {
     white-space: normal;
 }
 
-@media (max-width: 900px) {
+@media (max-width: 1000px) {
     .stlp-history-detail-rows,
     .stlp-page-host.stlp-layout-mobile .stlp-history-detail-rows {
         row-gap: 5px;
@@ -4615,7 +4615,7 @@ body.stlp-page-host-open {
     max-height: calc(100vh - env(safe-area-inset-top) - env(safe-area-inset-bottom) - 20px);
 }
 
-@media (max-width: 900px) {
+@media (max-width: 1000px) {
     .stlp-page-dialog {
         inset: 10px;
     }
@@ -4838,7 +4838,7 @@ body.stlp-page-host-open {
     }
 }
 
-@media (min-width: 901px) {
+@media (min-width: 1001px) {
     .stlp-page-backdrop {
         display: none;
     }

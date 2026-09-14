@@ -5215,12 +5215,16 @@ function buildWaitingRuleTimeGroupHtml(parts, extraClass = "") {
     `;
 }
 
+/* 断点必须跟着酒馆走：它在 ≤1000px 把 body 设成 position: fixed，配合 html 上的
+   -webkit-transform: translateZ(0)（html 因此成为固定定位后代的包含块），html 会塌成 0 高。
+   我们的宿主也是 position: fixed; inset: 0，跟着变 0 高后 overflow 把面板整个裁掉。
+   所以这一段只能走抽屉布局，不能用桌面态。 */
 function isDesktopLayout() {
-    return window.matchMedia("(min-width: 901px)").matches;
+    return window.matchMedia("(min-width: 1001px)").matches;
 }
 
 function isMobileDrawerLayout() {
-    return isIosWebKit() || window.matchMedia("(max-width: 900px)").matches;
+    return isIosWebKit() || window.matchMedia("(max-width: 1000px)").matches;
 }
 
 function lockBodyScrollForMobileDrawer() {
