@@ -14,8 +14,17 @@ const MINIMIZED_BUTTON_MARGIN = 18;
 const MINIMIZED_BUTTON_SIZE = 34;
 const MINIMIZED_BUTTON_DRAG_THRESHOLD = 4;
 const MINIMIZED_BUTTON_TOUCH_FALLBACK_IDLE_MS = 3000;
+// 兜底而已：正常情况靠 pointerup / pointercancel 收尾。超时提前触发最坏也只是多渲染一次，
+// 退回改动之前的行为，不会比现在更糟，所以不用取一个很长的值。
+const PANEL_SLIDER_INTERACTION_IDLE_MS = 8000;
 const MAIN_API_MANUAL_STOP_GRACE_MS = 1500;
 const MOBILE_OPEN_GUARD_MS = 360;
+// 消息区规整只为这几样醒来。反过来列"要忽略什么"是行不通的：酒馆流式输出时逐块重写的
+// 不止正文，还有 .mes_timer（script.js:3674）和推理块（reasoning.js:594），挨个拉黑等于
+// 把它的内部实现抄进我们的判断条件，它一改我们就漏。
+const CHAT_UI_STRUCTURE_SELECTOR = ".mes, .mes_block, .message, .avatar, .mesAvatar, .missing-avatar";
+const CHAT_UI_ATTRIBUTE_SELECTOR = ".mes, .mes_block, .message, .avatar, .mesAvatar, .avatar img, .mesAvatar img, .avatar_holder, .mesAvatarWrapper";
+const CHAT_UI_FULL_NORMALIZE_MIN_INTERVAL_MS = 200;
 const WAITING_QUEUE_EDIT_LOCK_MS = 1500;
 const PENDING_INJECTION_SOURCE_TTL_MS = 10000;
 // 生成类型来自 GENERATION_STARTED 事件，而拓展自己发的生成请求不走酒馆的 Generate()，
@@ -79,6 +88,7 @@ const PROMPT_ROLE_LABELS = {
 const DEFAULT_SETTINGS_SUBSECTION_OPEN_STATES = {
     appearance_theme: false,
     appearance_minimized_color: false,
+    appearance_main_api_alert: false,
 };
 
 const RUN_CHAT_MAP_REVISION = 2;
@@ -104,6 +114,7 @@ const DEFAULT_UI_SETTINGS = {
     minimizedButtonBackgroundMode: "mist",
     minimizedButtonPosition: null,
     mainApiErrorIndicatorEnabled: true,
+    mainApiErrorClearOnRegenerate: true,
     runFloorMap: {},
     runChatMap: {},
     runChatMapRevision: RUN_CHAT_MAP_REVISION,
@@ -442,8 +453,13 @@ const state = {
     minimizedButtonLongPressTriggered: false,
     minimizedButtonTouchFallback: null,
     minimizedButtonTouchFallbackTimerId: null,
+    sliderInteractionPointerId: null,
+    sliderInteractionRenderPending: false,
+    sliderInteractionTimerId: null,
     chatUiObserver: null,
     chatUiNormalizeScheduled: false,
+    chatUiNormalizeTimerId: null,
+    chatUiLastFullNormalizeAtMs: 0,
     historyDialogOpen: false,
     historyDeleteMode: false,
     historyAbnormalOnly: false,
@@ -535,6 +551,7 @@ function loadUiSettings() {
             minimizedButtonBackgroundMode: normalizeMinimizedButtonBackgroundMode(parsed?.minimizedButtonBackgroundMode),
             minimizedButtonPosition: normalizeMinimizedButtonPosition(parsed?.minimizedButtonPosition),
             mainApiErrorIndicatorEnabled: normalizeMainApiErrorIndicatorEnabled(parsed?.mainApiErrorIndicatorEnabled),
+            mainApiErrorClearOnRegenerate: normalizeMainApiErrorClearOnRegenerate(parsed?.mainApiErrorClearOnRegenerate),
             runFloorMap: parsed?.runFloorMap && typeof parsed.runFloorMap === "object" ? parsed.runFloorMap : {},
             runChatMap: shouldResetRunChatMap ? {} : (parsed?.runChatMap && typeof parsed.runChatMap === "object" ? parsed.runChatMap : {}),
             runChatMapRevision: RUN_CHAT_MAP_REVISION,
@@ -738,6 +755,16 @@ function isMainApiErrorIndicatorEnabled() {
     return normalizeMainApiErrorIndicatorEnabled(state.uiSettings.mainApiErrorIndicatorEnabled);
 }
 
+function normalizeMainApiErrorClearOnRegenerate(value) {
+    return value === undefined || value === null
+        ? DEFAULT_UI_SETTINGS.mainApiErrorClearOnRegenerate
+        : Boolean(value);
+}
+
+function isMainApiErrorClearOnRegenerateEnabled() {
+    return normalizeMainApiErrorClearOnRegenerate(state.uiSettings.mainApiErrorClearOnRegenerate);
+}
+
 // 只有明确存成 false 才算关掉：老配置里没有这个键，此时该沿用"有外圈"的既有外观。
 function normalizeMinimizedButtonBorderVisible(value) {
     return value === undefined || value === null
@@ -889,6 +916,23 @@ function clearMainApiError() {
 
     state.mainApiErrorActive = false;
     safeRenderPage();
+}
+
+// 你再发起一次生成，就说明这条提醒已经看到了，没必要让红色挂到下一次成功为止。
+// 这里是"先"复原：这次要是又出错，收尾时 markMainApiError 会重新点红。
+//
+// 判断写成"除了后台静默都算"而不是列白名单：类型由酒馆的 Generate(type) 直接下发
+// （script.js:4240），将来多一种类型或者某条路径漏传，白名单会静默失效，反向判断不会。
+function maybeClearMainApiErrorOnNewGeneration(generationType) {
+    if (!isMainApiErrorClearOnRegenerateEnabled()) {
+        return;
+    }
+
+    if (generationType === "quiet") {
+        return;
+    }
+
+    clearMainApiError();
 }
 
 function isVisibleElement(element) {
@@ -2637,6 +2681,13 @@ function safeRenderPage() {
         return;
     }
 
+    // 同一个坑的另一半：手指按在滑块上时，后台定时刷新照样会整块重写 innerHTML 把它换掉。
+    // 滑块自己的 input 事件早就绕开了重渲染，但挡不住外部来源，所以按下期间一并挂起。
+    if (state.sliderInteractionPointerId !== null) {
+        state.sliderInteractionRenderPending = true;
+        return;
+    }
+
     runSafely("渲染独立页面", () => {
         renderPage();
     });
@@ -2667,6 +2718,36 @@ function flushDeferredColorWheelRender() {
 
     state.colorWheelRenderPending = false;
     safeRenderPage();
+}
+
+function beginPanelSliderInteraction(pointerId) {
+    state.sliderInteractionPointerId = pointerId;
+    if (state.sliderInteractionTimerId) {
+        clearTimeout(state.sliderInteractionTimerId);
+    }
+
+    state.sliderInteractionTimerId = window.setTimeout(() => {
+        runSafely("滑块交互超时收尾", () => {
+            endPanelSliderInteraction();
+        });
+    }, PANEL_SLIDER_INTERACTION_IDLE_MS);
+}
+
+function endPanelSliderInteraction() {
+    if (state.sliderInteractionTimerId) {
+        clearTimeout(state.sliderInteractionTimerId);
+        state.sliderInteractionTimerId = null;
+    }
+
+    if (state.sliderInteractionPointerId === null) {
+        return;
+    }
+
+    state.sliderInteractionPointerId = null;
+    if (state.sliderInteractionRenderPending) {
+        state.sliderInteractionRenderPending = false;
+        safeRenderPage();
+    }
 }
 
 function setWaitingQueueEditLock(runId, durationMs = WAITING_QUEUE_EDIT_LOCK_MS) {
@@ -4794,6 +4875,20 @@ function getMessageAvatarReferenceKeys(root) {
     return [...new Set(keys.filter(Boolean))];
 }
 
+// 写之前先确认真的有东西要清。无条件写会改动 style 属性，而 style 在观察列表里——
+// 那就是这个函数自己把自己的下一轮重扫排上队。
+function clearInlineHiddenState(node) {
+    for (const property of ["display", "visibility", "opacity"]) {
+        if (node.style.getPropertyValue(property)) {
+            node.style.removeProperty(property);
+        }
+    }
+
+    if (node.hasAttribute("hidden")) {
+        node.removeAttribute("hidden");
+    }
+}
+
 function normalizeChatMessageUi() {
     const messageRoots = document.querySelectorAll(".mes, .mes_block, .message");
     const avatarReferences = new Map();
@@ -4833,39 +4928,9 @@ function normalizeChatMessageUi() {
             }
         }
 
-        const counterNodes = root.querySelectorAll(".tokenCounterDisplay");
-        for (const counterNode of counterNodes) {
-            if (!(counterNode instanceof HTMLElement)) {
-                continue;
-            }
-
-            if (counterNode.textContent) {
-                counterNode.textContent = "";
-            }
-
-            if (counterNode.getAttribute("title")) {
-                counterNode.setAttribute("title", "");
-            }
-
-            counterNode.setAttribute("aria-hidden", "true");
-        }
-
-        const timerNodes = root.querySelectorAll(".mes_timer");
-        for (const timerNode of timerNodes) {
-            if (!(timerNode instanceof HTMLElement)) {
-                continue;
-            }
-
-            if (timerNode.textContent) {
-                timerNode.textContent = "";
-            }
-
-            if (timerNode.getAttribute("title")) {
-                timerNode.setAttribute("title", "");
-            }
-
-            timerNode.setAttribute("aria-hidden", "true");
-        }
+        // .mes_timer 和 .tokenCounterDisplay 不在这里处理：style.css 顶部已经把它们
+        // display: none 掉了。别再加回逐帧擦文本的逻辑——酒馆每收到一块就往 .mes_timer 写一次，
+        // 擦除本身又是一次被观察的变动，两边对着写能把全量重扫一直推下去。
 
         const avatarHost = root.querySelector(".avatar, .mesAvatar");
         const missingAvatar = avatarHost?.querySelector(".missing-avatar");
@@ -4898,16 +4963,10 @@ function normalizeChatMessageUi() {
                     avatarImage.closest(".mesAvatarWrapper"),
                 ].filter((node) => node instanceof HTMLElement);
 
-                avatarImage.style.removeProperty("display");
-                avatarImage.style.removeProperty("visibility");
-                avatarImage.style.removeProperty("opacity");
-                avatarImage.removeAttribute("hidden");
+                clearInlineHiddenState(avatarImage);
 
                 for (const container of avatarContainers) {
-                    container.style.removeProperty("display");
-                    container.style.removeProperty("visibility");
-                    container.style.removeProperty("opacity");
-                    container.removeAttribute("hidden");
+                    clearInlineHiddenState(container);
                 }
 
                 const placeholder = avatarImage.parentElement?.querySelector(".missing-avatar");
@@ -4919,6 +4978,24 @@ function normalizeChatMessageUi() {
     }
 }
 
+function runFullChatMessageUiNormalization() {
+    state.chatUiLastFullNormalizeAtMs = Date.now();
+    runSafely("同步消息区楼层与头像显示", () => {
+        normalizeChatMessageUi();
+    });
+}
+
+function queueDeferredChatMessageUiNormalization(delayMs) {
+    if (state.chatUiNormalizeTimerId !== null) {
+        return;
+    }
+
+    state.chatUiNormalizeTimerId = window.setTimeout(() => {
+        state.chatUiNormalizeTimerId = null;
+        runFullChatMessageUiNormalization();
+    }, Math.max(0, delayMs));
+}
+
 function scheduleChatMessageUiNormalization() {
     if (state.chatUiNormalizeScheduled) {
         return;
@@ -4927,10 +5004,52 @@ function scheduleChatMessageUiNormalization() {
     state.chatUiNormalizeScheduled = true;
     window.requestAnimationFrame(() => {
         state.chatUiNormalizeScheduled = false;
-        runSafely("同步消息区楼层与头像显示", () => {
-            normalizeChatMessageUi();
-        });
+        const sinceLast = Date.now() - state.chatUiLastFullNormalizeAtMs;
+        if (sinceLast < CHAT_UI_FULL_NORMALIZE_MIN_INTERVAL_MS) {
+            // 白名单挡住的是已知的高频源，这条兜底防的是没预料到的那些。延后补一次，不能直接丢，
+            // 否则被节流掉的那次结构变动就永远不会被规整。
+            queueDeferredChatMessageUiNormalization(CHAT_UI_FULL_NORMALIZE_MIN_INTERVAL_MS - sinceLast);
+            return;
+        }
+
+        runFullChatMessageUiNormalization();
     });
+}
+
+function isWatchedChatUiNode(node) {
+    return node instanceof HTMLElement
+        && (node.matches(CHAT_UI_STRUCTURE_SELECTOR) || Boolean(node.querySelector(CHAT_UI_STRUCTURE_SELECTOR)));
+}
+
+function chatMutationNeedsNormalization(mutation) {
+    const target = mutation.target;
+    const targetElement = target instanceof HTMLElement ? target : target?.parentElement;
+    if (!(targetElement instanceof HTMLElement)) {
+        return false;
+    }
+
+    if (mutation.type === "characterData") {
+        // 需要我们改写文本的只有楼层号。正文和计时的文本每块都在变，放进来就等于没做过滤。
+        return targetElement.classList.contains("mesIDDisplay");
+    }
+
+    if (mutation.type === "attributes") {
+        return targetElement.matches(CHAT_UI_ATTRIBUTE_SELECTOR);
+    }
+
+    // 楼层号要一起认：往里写文本时如果原来就有文本节点，产生的是 childList 而不是 characterData，
+    // 新增的又是文本节点，光看 addedNodes 会漏掉。
+    if (targetElement.matches(".avatar, .mesAvatar, .mesIDDisplay")) {
+        return true;
+    }
+
+    for (const node of mutation.addedNodes) {
+        if (isWatchedChatUiNode(node)) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 function supportsMutationObserver() {
@@ -4957,8 +5076,13 @@ function startChatUiObserver() {
         return;
     }
 
-    const observer = new MutationObserver(() => {
-        scheduleChatMessageUiNormalization();
+    const observer = new MutationObserver((mutations) => {
+        for (const mutation of mutations) {
+            if (chatMutationNeedsNormalization(mutation)) {
+                scheduleChatMessageUiNormalization();
+                return;
+            }
+        }
     });
 
     observer.observe(chatRoot, {
@@ -6909,6 +7033,7 @@ function installGenerationSettingsHook() {
     eventSource.on(event_types.GENERATION_STARTED, (generationType, _options, dryRun) => {
         if (!dryRun) {
             setPendingGenerationType(generationType);
+            maybeClearMainApiErrorOnNewGeneration(generationType);
         }
         markSillyTavernGenerationStarted();
     });
@@ -8143,6 +8268,7 @@ function buildSettingsContentHtml() {
     const minimizedButtonBorderColor = normalizeMinimizedButtonBorderColor(state.uiSettings.minimizedButtonBorderColor);
     const minimizedButtonBorderVisible = isMinimizedButtonBorderVisible();
     const mainApiErrorIndicatorEnabled = isMainApiErrorIndicatorEnabled();
+    const mainApiErrorClearOnRegenerate = isMainApiErrorClearOnRegenerateEnabled();
     const minimizedButtonOpacityPercent = getMinimizedButtonOpacityPercent();
     const isMinimizedButtonFollowingTheme = minimizedButtonColorMode === "follow_theme";
     const themeSummary = getThemeModeLabel(state.uiSettings.themeMode).replace("主题：", "");
@@ -8179,11 +8305,6 @@ function buildSettingsContentHtml() {
                 <input id="stlp_minimized_button_border_visible" type="checkbox" ${minimizedButtonBorderVisible ? "checked" : ""} />
                 <span>显示图标外圈</span>
             </label>
-            <label class="checkbox_label stlp-settings-toggle">
-                <input id="stlp_main_api_error_indicator_enabled" type="checkbox" ${mainApiErrorIndicatorEnabled ? "checked" : ""} />
-                <span>主 API 出错时提醒</span>
-            </label>
-            <div class="stlp-note">开着的话：主 API 请求报错、超时或中途断流时，收起的星星会变红；面板正开着的时候星星看不见，改在顶部显示一条横幅。你自己点停止不算出错。星星点开面板、或者横幅上点"知道了"，都算确认过，提醒立刻消失；下一次请求正常完成也会自动复原。</div>
             <label class="stlp-color-wheel-field ${minimizedButtonBorderVisible ? "" : "is-disabled"}">
                 <span>外圈边框</span>
                 <div class="stlp-color-wheel-row">
@@ -8201,11 +8322,27 @@ function buildSettingsContentHtml() {
             </label>
             <div class="stlp-note">按钮背景本来就是透明的，能看见的只有星星、描边和外圈这三样，三者都能单独选色，外圈还可以整个关掉。不透明度最低 ${Math.round(MINIMIZED_BUTTON_OPACITY_MIN * 100)}%——它是唤回面板的唯一入口，留一点可见度才找得回来。后台连不上时图标会变红，这个红同样跟着不透明度走。</div>
     `;
+    const mainApiAlertSummary = mainApiErrorIndicatorEnabled
+        ? `已开启 · ${mainApiErrorClearOnRegenerate ? "重新生成时先复原" : "等下次成功才复原"}`
+        : "已关闭";
+    const mainApiAlertSubsectionBody = `
+            <label class="checkbox_label stlp-settings-toggle">
+                <input id="stlp_main_api_error_indicator_enabled" type="checkbox" ${mainApiErrorIndicatorEnabled ? "checked" : ""} />
+                <span>主 API 出错时提醒</span>
+            </label>
+            <div class="stlp-note">开着的话：主 API 请求报错、超时或中途断流时，收起的星星会变红；面板正开着的时候星星看不见，改在顶部显示一条横幅。你自己点停止不算出错。星星点开面板、或者横幅上点"知道了"，都算确认过，提醒立刻消失；下一次请求正常完成也会自动复原。</div>
+            <label class="checkbox_label stlp-settings-toggle ${mainApiErrorIndicatorEnabled ? "" : "is-disabled"}">
+                <input id="stlp_main_api_error_clear_on_regenerate" type="checkbox" ${mainApiErrorClearOnRegenerate ? "checked" : ""} ${mainApiErrorIndicatorEnabled ? "" : "disabled"} />
+                <span>重新生成时先复原颜色</span>
+            </label>
+            <div class="stlp-note">勾上之后，只要你再发起一次生成，星星立刻回到平时的颜色，不用等这次跑完——正常发送、重新生成、滑动、续写、替我说都算，只有后台静默的请求不算。叫"先"复原是因为它可能是暂时的：这次要是又出错，收尾时还会再变红。不勾就一直红到下一次真的成功为止。</div>
+    `;
     const appearanceContent = `
             <div class="stlp-settings-subtitle">外观与主题</div>
             <div class="stlp-note">调整面板主题和最小化悬浮图标的外观。悬浮图标平时显示你选的颜色，后台连不上时会自动变红，方便一眼看出监控是不是还在正常工作。</div>
             ${buildSettingsSubsectionHtml("appearance_theme", "面板主题", themeSummary, themeSubsectionBody)}
             ${buildSettingsSubsectionHtml("appearance_minimized_color", "最小图标选色", minimizedIconSummary, minimizedIconSubsectionBody)}
+            ${buildSettingsSubsectionHtml("appearance_main_api_alert", "主 API 出错提醒", mainApiAlertSummary, mainApiAlertSubsectionBody)}
     `;
 
     const categoryCards = [
@@ -9835,6 +9972,13 @@ function handlePanelChangeTarget(target) {
         return true;
     }
 
+    if (target.id === "stlp_main_api_error_clear_on_regenerate") {
+        state.uiSettings.mainApiErrorClearOnRegenerate = Boolean(target.checked);
+        saveUiSettings();
+        safeRenderPage();
+        return true;
+    }
+
     if (target.id === "stlp_minimized_button_border_color") {
         state.uiSettings.minimizedButtonBorderColor = normalizeMinimizedButtonBorderColor(target.value);
         saveUiSettings();
@@ -10786,6 +10930,33 @@ function bindUiEvents() {
     if (state.eventsBound) {
         return;
     }
+
+    // 捕获阶段监听：中途有谁 stopPropagation 也不会漏掉收尾，否则面板会一直停更。
+    document.addEventListener("pointerdown", (event) => {
+        runSafely("记录滑块交互开始", () => {
+            const target = event.target;
+            if (!(target instanceof HTMLElement)
+                || !target.matches(".stlp-slider-input")
+                || !target.closest("#stlp_page")) {
+                return;
+            }
+
+            beginPanelSliderInteraction(event.pointerId);
+        });
+    }, true);
+
+    const handlePanelSliderInteractionEnd = (event) => {
+        runSafely("记录滑块交互结束", () => {
+            if (state.sliderInteractionPointerId === null
+                || (event && event.pointerId !== state.sliderInteractionPointerId)) {
+                return;
+            }
+
+            endPanelSliderInteraction();
+        });
+    };
+    document.addEventListener("pointerup", handlePanelSliderInteractionEnd, true);
+    document.addEventListener("pointercancel", handlePanelSliderInteractionEnd, true);
 
     document.addEventListener("input", (event) => {
         runSafely("处理等待区输入", () => {

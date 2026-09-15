@@ -726,6 +726,11 @@ body.stlp-page-host-open {
     border-color: color-mix(in srgb, var(--stlp-highlight-danger-strong-border) 92%, transparent);
 }
 
+/* 这里不能收到 pan-y：touch-action 取的是「被碰元素 + 祖先」的交集，而遍历会一直走到
+   第一个包含它的滚动元素——也就是本元素。收成 pan-y 等于宣告这片区域不接横向手势，
+   而拖 range 滑块正是浏览器实现的横向默认行为，于是第一下直接被吞掉。
+   子元素放宽不回来（交集只会更严），所以口子必须开在这一层。
+   manipulation = pan-x pan-y pinch-zoom，比 auto 严，只是多放开了横向。 */
 .stlp-page-scroll {
     flex: 1 1 auto;
     min-height: 0;
@@ -733,7 +738,7 @@ body.stlp-page-host-open {
     padding: 8px 16px 16px;
     overscroll-behavior: contain;
     -webkit-overflow-scrolling: touch;
-    touch-action: pan-y;
+    touch-action: manipulation;
 }
 
 .stlp-section-stack {
@@ -1328,11 +1333,15 @@ body.stlp-page-host-open {
     width: 100%;
 }
 
+/* 这里必须左对齐，不能跟着上面那条共用规则居中：药丸是整列等宽的，而三个标签字数不同
+   （4 / 6 / 5 字），居中会让复选框各落各的位置——实测同一列里能差 6px，移动端叠成一列后
+   差 12px。左对齐之后复选框一律贴着 padding-left，三行严格对齐。
+   共用规则里的 center 留给 .stlp-toolbar-button：那两个是纯文字，没有要对齐的前导方块。 */
 .stlp-toolbar-toggle {
     display: inline-flex;
     width: 100%;
     gap: 8px;
-    justify-content: center;
+    justify-content: flex-start;
 }
 
 .stlp-toolbar-toggle span {
@@ -1709,7 +1718,8 @@ body.stlp-page-host-open {
     min-width: 0;
 }
 
-.stlp-color-wheel-field.is-disabled {
+.stlp-color-wheel-field.is-disabled,
+.stlp-settings-toggle.is-disabled {
     opacity: 0.7;
 }
 
@@ -2117,9 +2127,13 @@ body.stlp-page-host-open {
     margin-bottom: 12px;
 }
 
+/* 子节里的开关是直接挂在 .stlp-settings-subsection-body 下的，够不着 .stlp-controls，
+   所以下面这几条统一带上它——别改成只认 .stlp-settings-toggle，那个类还挂在
+   .stlp-controls 里的 9 个开关和价格表那个上面，会把 4 个的改动摊成 14 个的风险。 */
 .stlp-controls > .checkbox_label,
 .stlp-controls > .stlp-number,
-.stlp-controls > .stlp-select {
+.stlp-controls > .stlp-select,
+.stlp-settings-subsection-body > .checkbox_label {
     padding: 10px 12px;
     border: 1px solid var(--stlp-border-soft);
     border-radius: 10px;
@@ -2127,7 +2141,8 @@ body.stlp-page-host-open {
     box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
 }
 
-.stlp-controls > .checkbox_label {
+.stlp-controls > .checkbox_label,
+.stlp-settings-subsection-body > .checkbox_label {
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -2138,16 +2153,25 @@ body.stlp-page-host-open {
     transition: background-color 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease;
 }
 
-.stlp-controls > .checkbox_label:hover {
+/* 对齐相邻的 .stlp-color-wheel-field / .stlp-slider-field。
+   :first-child 另有一条 10px 的规则（本文件靠前），特异性更高，会照常盖住这条。 */
+.stlp-settings-subsection-body > .checkbox_label {
+    margin-top: 8px;
+}
+
+.stlp-controls > .checkbox_label:hover,
+.stlp-settings-subsection-body > .checkbox_label:hover {
     background: color-mix(in srgb, var(--stlp-surface-1) 86%, var(--stlp-primary) 8%);
     border-color: color-mix(in srgb, var(--stlp-border-soft) 82%, var(--stlp-primary) 18%);
 }
 
-.stlp-controls > .checkbox_label span {
+.stlp-controls > .checkbox_label span,
+.stlp-settings-subsection-body > .checkbox_label span {
     flex: 1 1 auto;
 }
 
-.stlp-controls input[type="checkbox"] {
+.stlp-controls input[type="checkbox"],
+.stlp-settings-subsection-body input[type="checkbox"] {
     appearance: none;
     -webkit-appearance: none;
     width: 18px;
@@ -2161,7 +2185,8 @@ body.stlp-page-host-open {
     flex: 0 0 auto;
 }
 
-.stlp-controls input[type="checkbox"]::after {
+.stlp-controls input[type="checkbox"]::after,
+.stlp-settings-subsection-body input[type="checkbox"]::after {
     content: "";
     position: absolute;
     left: 5px;
@@ -2174,20 +2199,23 @@ body.stlp-page-host-open {
     transition: transform 0.12s ease;
 }
 
-.stlp-controls input[type="checkbox"]:checked {
+.stlp-controls input[type="checkbox"]:checked,
+.stlp-settings-subsection-body input[type="checkbox"]:checked {
     background: var(--stlp-checkbox-accent);
     border-color: color-mix(in srgb, var(--stlp-checkbox-accent) 78%, #000 22%);
     box-shadow: none;
 }
 
-.stlp-controls input[type="checkbox"]:checked::after {
+.stlp-controls input[type="checkbox"]:checked::after,
+.stlp-settings-subsection-body input[type="checkbox"]:checked::after {
     border-color: #ffffff;
     transform: rotate(45deg) scale(1);
 }
 
 .stlp-controls > .checkbox_label span,
 .stlp-controls > .stlp-number span,
-.stlp-controls > .stlp-select span {
+.stlp-controls > .stlp-select span,
+.stlp-settings-subsection-body > .checkbox_label span {
     color: var(--stlp-panel-text);
 }
 
@@ -4029,13 +4057,6 @@ body.stlp-page-host-open {
     pointer-events: none;
 }
 
-/* 最小化态整块 host 只有那颗星星，没有任何需要平移的内容，这里明确关掉平移手势。
-   这是加固，不是根治：拖动被掐断的成因还没定论（见 design-android-drag-cancel.local.md）。
-   注意不能挂到展开态上——touch-action 沿祖先取交集，加上去面板内部就滚不动了。 */
-.stlp-page-host.stlp-page-minimized {
-    touch-action: none;
-}
-
 .stlp-page-host.stlp-layout-mobile .stlp-page-header,
 .stlp-page-host.stlp-layout-mobile .stlp-page-toolbar,
 .stlp-page-host.stlp-layout-mobile .stlp-page-scroll,
@@ -4152,6 +4173,14 @@ body.stlp-page-host-open {
     width: 100%;
 }
 
+/* 整行宽的药丸里贴左会让右边空一大片。给一个固定百分比的缩进把整组推到接近中线，
+   观感回来了，勾选框也仍然落在同一个 x 上。
+   和 justify-content: center 的区别就在这儿：居中居的是「组」，组宽随文字长度变
+   （4 / 6 / 5 字），勾选框就会各错各的；缩进是固定量，跟文字长度无关。 */
+.stlp-page-host.stlp-layout-mobile .stlp-toolbar-filters .stlp-toolbar-toggle {
+    padding-left: 34%;
+}
+
 .stlp-page-host.stlp-layout-mobile .stlp-page-scroll {
     padding-top: 10px;
     padding-bottom: 18px;
@@ -4179,7 +4208,8 @@ body.stlp-page-host-open {
 
 .stlp-page-host.stlp-layout-mobile .stlp-controls > .checkbox_label,
 .stlp-page-host.stlp-layout-mobile .stlp-controls > .stlp-number,
-.stlp-page-host.stlp-layout-mobile .stlp-controls > .stlp-select {
+.stlp-page-host.stlp-layout-mobile .stlp-controls > .stlp-select,
+.stlp-page-host.stlp-layout-mobile .stlp-settings-subsection-body > .checkbox_label {
     padding: 9px 10px;
 }
 
