@@ -9,6 +9,10 @@ const start = source.indexOf('function recordLiteGeneration(');
 const end = source.indexOf('\nfunction installOutgoingGenerationHook()', start);
 assert.ok(start >= 0 && end > start);
 const hook = source.slice(start, end);
+const stopStart = source.indexOf('function sendClientStopSignal(');
+const stopEnd = source.indexOf('\nfunction sendForceStopDiagnostics(', stopStart);
+assert.ok(stopStart >= 0 && stopEnd > stopStart);
+const stopHook = source.slice(stopStart, stopEnd);
 const tick = () => new Promise(resolve => setImmediate(resolve));
 function deferred() {
     let resolve;
@@ -20,10 +24,10 @@ function harness({ mode = 'lite', detectedMode = 'lite', settings = {}, initFail
     const saved = deferred();
     const runs = [];
     const errors = [];
-    const state = { recordSourceMode: mode, legacyLiteViewing: false };
+    const state = { recordSourceMode: mode, legacyLiteViewing: false, liteActiveRuns: new Set() };
     let cloneBody;
     const recorder = {
-        createLiteRun: body => ({ stream: body.stream }),
+        createLiteRun: body => ({ stream: body.stream, label: body.label }),
         markLiteResponseHeaders: (run, response) => { run.http_status = response.status; },
         consumeLiteResponse: async (run, response) => {
             cloneBody = response.body;
@@ -49,8 +53,10 @@ function harness({ mode = 'lite', detectedMode = 'lite', settings = {}, initFail
         recordUsageInjectionOutcome: () => {},
     });
     vm.runInContext(hook, context);
+    vm.runInContext(stopHook, context);
     return {
-        record: (promise, stream = false) => context.recordLiteGeneration({ body: JSON.stringify({ stream }) }, promise),
+        record: (promise, stream = false, label) => context.recordLiteGeneration({ body: JSON.stringify({ stream, label }) }, promise),
+        stop: () => context.sendClientStopSignal(),
         gate, saved, runs, errors, state,
         get cloneBody() { return cloneBody; },
     };
@@ -109,6 +115,24 @@ test('aborted WS-like stream fails independently in caller and recorder', async 
     await assert.rejects(caller, { name: 'AbortError' });
     h.gate.resolve();
     assert.equal((await h.saved.promise).error.name, 'AbortError');
+});
+
+test('stop marks the main reply even after a later side generation already finished', async () => {
+    const h = harness();
+    const main = deferred();
+    const side = deferred();
+    h.record(main.promise, true, 'main');
+    h.record(side.promise, false, 'side');
+    h.gate.resolve();
+    side.resolve(new Response('{}'));
+    for (let n = 0; n < 20 && h.runs.length < 1; n++) await tick();
+    assert.deepEqual(h.runs.map(run => run.label), ['side']);
+    h.stop();
+    main.resolve(new Response('data: partial\n\n'));
+    for (let n = 0; n < 20 && h.runs.length < 2; n++) await tick();
+    assert.equal(h.runs.find(run => run.label === 'main').client_stopped, true);
+    assert.equal(h.runs.find(run => run.label === 'side').client_stopped, undefined);
+    assert.equal(h.state.liteActiveRuns.size, 0);
 });
 
 test('known full mode skips cloning and recording', async () => {

@@ -394,8 +394,10 @@ const state = {
     // 记录从哪来：full 走后端插件，lite 走浏览器本地采集。
     // unknown 表示还没探测完，此时不采集，避免和后端重复记一遍。
     recordSourceMode: "unknown",
-    // 精简模式下正在进行的那条记录，停止按钮要靠它打"用户主动停止"的标记。
-    liteActiveRun: null,
+    // 精简模式下所有正在进行的记录，停止按钮要靠它打"用户主动停止"的标记。
+    // 必须是全部而不是最后一条：酒馆的停止会连带中止扩展发起的 generateRaw，
+    // 只记最后一条的话，先开始的主回复会在旁路请求之后被漏掉。
+    liteActiveRuns: new Set(),
     // 从精简版升级到完整版之后，浏览器里那批旧记录不会自动消失，但面板改读后端就看不见了。
     // 这两个字段负责把它们摆到明面上，而不是让用户以为数据没了。
     legacyLiteRunCount: 0,
@@ -1628,8 +1630,8 @@ function sendClientStopSignal() {
     // 精简模式下这条记录就在本进程里，直接打标记即可，不需要绕一圈发给后端。
     // 临时查看旧记录时不算，那种情况下真正在记录的仍然是后端。
     if (state.recordSourceMode === "lite" && !state.legacyLiteViewing) {
-        if (state.liteActiveRun) {
-            state.liteActiveRun.client_stopped = true;
+        for (const run of state.liteActiveRuns) {
+            run.client_stopped = true;
         }
         return Promise.resolve();
     }
@@ -6958,7 +6960,7 @@ function recordLiteGeneration(effectiveInit, responsePromise) {
             // 拿不到 token 时面板要说明成因，而成因只有请求发出的那一刻才知道
             // （事后从记录里反推不出用户当时填没填附加参数）。
             run.usage_capture = describeUsageCaptureMode(requestBody);
-            state.liteActiveRun = run;
+            state.liteActiveRuns.add(run);
 
             try {
                 const captured = await capturedResponse;
@@ -6991,8 +6993,8 @@ function recordLiteGeneration(effectiveInit, responsePromise) {
                     }
                 }).catch(() => {});
             }
-            if (run && state.liteActiveRun === run) {
-                state.liteActiveRun = null;
+            if (run) {
+                state.liteActiveRuns.delete(run);
             }
         }
     })();

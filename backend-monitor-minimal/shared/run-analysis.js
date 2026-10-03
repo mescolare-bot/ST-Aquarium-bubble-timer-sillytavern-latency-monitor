@@ -251,8 +251,14 @@ export function detectAbnormalType(run) {
 
     // 断连要排在流式中断和"未输出即失败"之前：这两类描述的是现象，而断连是确定的成因，
     // 归错了会把用户引去换模型、关流式，而真正该看的是自己这一侧的连接。
+    // 主动停止不能靠错误文本认：精简形态在浏览器里读流，Chrome 中止时报的是
+    // "BodyStreamBuffer was aborted"，不命中上面的正则，而停止按钮打的标记本身是可靠的。
+    if (run.client_stopped) {
+        return 'client_stopped';
+    }
+
     if (isClientAbortError(errorText)) {
-        return run.client_stopped ? 'client_stopped' : 'client_disconnected';
+        return 'client_disconnected';
     }
 
     if (isTimeout) {
