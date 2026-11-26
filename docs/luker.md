@@ -11,7 +11,7 @@ node install.mjs /path/to/Luker --dry-run
 node install.mjs /path/to/Luker
 ```
 
-安装器识别 `runLukerDispatch` 架构，为 chat-completions 的 provider dispatch 加监控包装，跳过原版 SillyTavern 的九处旧锚点。安装前检查补丁和语法，不兼容时不放置文件或删除重复安装。升级 Luker 后先重新 dry-run，再安装。卸载仍使用 `--uninstall`。
+安装器识别 `runLukerDispatch` 架构，为 chat-completions 的 provider dispatch 加监控包装，跳过原版 SillyTavern 的补丁集合（当前十九处）。安装前检查补丁和语法，不兼容时不放置文件或删除重复安装。升级 Luker 后先重新 dry-run，再安装。卸载仍使用 `--uninstall`。
 
 源码兼容性检查覆盖 Luker `90d80f774` 与 `f18f73ca006318beacac5db0eed762a32f02a561`。这是源码/合成测试验证，尚未连接真实模型或在用户服务器部署验收。
 

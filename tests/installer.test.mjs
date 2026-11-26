@@ -17,11 +17,44 @@ router.post('/generate', async function (req, res) {
     });
 });
 `;
-// Minimal syntax-valid vanilla handler exercising all original production anchors.
+// Syntax-valid provider fixtures exercise the production patch anchors without
+// importing SillyTavern or making any model requests.
 const p = Object.fromEntries(chatCompletionsPatches.map(patch => [patch.id, patch.anchor]));
+const gemini = `/**
+${p['gemini-signature']}
+    const stream = request.body.stream;
+    const apiName = 'Google AI Studio';
+    const body = {}, headers = {}, controller = new AbortController(), url = 'https://fixture.invalid';
+    try {
+${p['gemini-fetch']}
+        if (stream) {
+            try {
+${p['gemini-stream']}
+            } catch (error) {
+${p['gemini-stream-error']}
+            }
+        } else {
+${p['gemini-json']}
+            if (!candidates || candidates.length === 0) {
+                const message = 'No candidates';
+${p['gemini-no-candidate']}
+            if (!responseContent) {
+${p['gemini-empty']}
+            }
+            return response.send(responseContent);
+        }
+    } catch (error) {
+${p['gemini-exception']}
+    }
+}
+`;
 const vanilla = `${p.import}
+${gemini}
 ${p.declare}
 ${p.create}
+        switch (request.body.chat_completion_source) {
+${p['gemini-dispatch']}
+        }
         const requestBody = {
 ${p.usage}
 ${p.fetch}
@@ -35,13 +68,14 @@ ${p.exception}
     }
 });
 `;
-function patch(source) {
-    for (const entry of getChatCompletionsPatches(source)) {
+function patch(source, entries = getChatCompletionsPatches(source)) {
+    for (const entry of entries) {
         if (!source.includes(entry.detect)) source = source.replace(entry.anchor, entry.build(entry.anchor));
     }
     return source;
 }
-for (const [name, source, count] of [['Luker', luker, 2], ['vanilla', vanilla, 9]]) {
+const legacyVanilla = patch(vanilla, chatCompletionsPatches.filter(entry => !entry.id.startsWith('gemini-')));
+for (const [name, source, count] of [['Luker', luker, 2], ['vanilla', vanilla, 19]]) {
     test(`${name}: descriptor selection, partial detection, and idempotence`, () => {
         assert.equal(inspectChatCompletionsPatches(source).state, 'absent');
         assert.equal(getChatCompletionsPatches(source).length, count);
@@ -53,6 +87,13 @@ for (const [name, source, count] of [['Luker', luker, 2], ['vanilla', vanilla, 9
         assert.equal(patch(result), result);
     });
 }
+test('old vanilla backend reports the ten missing Gemini patches', () => {
+    const inspection = inspectChatCompletionsPatches(legacyVanilla);
+    assert.equal(inspection.state, 'partial');
+    assert.equal(inspection.missing.length, 10);
+    assert.ok(inspection.missing.every(entry => entry.id.startsWith('gemini-')));
+    assert.equal(patch(legacyVanilla), patch(vanilla));
+});
 function fixture(t, source) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'aquarium-installer-'));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -67,14 +108,17 @@ function fixture(t, source) {
     return { root, target, duplicate };
 }
 function install(root, ...args) {
-    // Run the inspected local installer only, against a disposable fixture. It
-    // copies files and invokes node --check; no target modules are imported.
     return spawnSync(process.execPath, [path.join(repo, 'install.mjs'), root, ...args], { encoding: 'utf8' });
 }
 function success(result) {
     assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
 }
-for (const [name, source] of [['Luker', luker], ['vanilla', vanilla], ['Luker CRLF', luker.replace(/\n/g, '\r\n')]]) {
+for (const [name, source] of [
+    ['Luker', luker], ['vanilla', vanilla],
+    ['vanilla existing backend', legacyVanilla],
+    ['vanilla CRLF', vanilla.replace(/\n/g, '\r\n')],
+    ['Luker CRLF', luker.replace(/\n/g, '\r\n')],
+]) {
     test(`${name}: install twice, dry run, and uninstall`, t => {
         const { root, target, duplicate } = fixture(t, source);
         success(install(root, '--dry-run'));

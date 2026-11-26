@@ -154,7 +154,7 @@ import { inferPermissionLevelFromHost } from './settings-ui/service/monitor-sett
 
 **先备份**：`cp chat-completions.js chat-completions.js.bak`
 
-一共 9 处插入。每一处都是"找到锚点，在它前后插入几行"，不要删除任何原有代码。
+下文保留的是 OpenAI 兼容通道原有的 9 处手工补丁说明。0.1.36 起完整版共 19 处，另外 10 处用于原生 Gemini；请优先运行根目录的 `install.mjs`，以 `backend-monitor-minimal/shared/chat-completions-patch.js` 中的统一定义为准。只完成下面九处不会覆盖原生 Gemini。
 
 > 这些插入点的权威定义在 [`backend-monitor-minimal/shared/chat-completions-patch.js`](../backend-monitor-minimal/shared/chat-completions-patch.js)
 > ——安装脚本和面板自检都读它。本节内容如果和那个文件对不上，以那个文件为准。

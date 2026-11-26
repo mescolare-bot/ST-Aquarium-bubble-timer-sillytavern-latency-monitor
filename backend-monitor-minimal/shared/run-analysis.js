@@ -196,6 +196,22 @@ export function extractResponseText(payload) {
         }
     }
 
+    // Native Gemini carries visible text in candidates, with thoughts in separate parts.
+    if (choices.length === 0 && Array.isArray(payload?.candidates)) {
+        for (const candidate of payload.candidates) {
+            const content = candidate?.content ?? candidate?.output;
+            if (typeof content === 'string') {
+                text += content;
+            } else if (Array.isArray(content?.parts)) {
+                for (const part of content.parts) {
+                    if (!part?.thought && typeof part?.text === 'string') {
+                        text += part.text;
+                    }
+                }
+            }
+        }
+    }
+
     return text;
 }
 
@@ -771,6 +787,9 @@ export function buildGeminiResponseUsage(usageMetadata) {
         completion_tokens: readFirstUsageNumber(usageMetadata, [
             ['candidatesTokenCount'],
             ['outputTokenCount'],
+        ]),
+        reasoning_tokens: readFirstUsageNumber(usageMetadata, [
+            ['thoughtsTokenCount'],
         ]),
         total_tokens: readFirstUsageNumber(usageMetadata, [
             ['totalTokenCount'],

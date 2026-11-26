@@ -139,6 +139,152 @@ export const chatCompletionsPatches = [
         await monitor?.finalize({ outcome: 'exception' });
         console.error('Generation failed', error);`,
     },
+    {
+        id: 'gemini-signature',
+        label: 'Gemini 处理函数接收监控器',
+        impact: 'Gemini 原生请求没有完整监控记录',
+        detect: `async function sendMakerSuiteRequest(request, response, monitor = null)`,
+        anchor: ` * @param {express.Response} response Express response
+ */
+async function sendMakerSuiteRequest(request, response) {`,
+        build: () => ` * @param {express.Response} response Express response
+ * @param {ReturnType<typeof createGenerationMonitor> | null} monitor Generation monitor
+ */
+async function sendMakerSuiteRequest(request, response, monitor = null) {`,
+    },
+    {
+        id: 'gemini-create',
+        label: '监控 Google AI Studio 和 Vertex AI 来源',
+        impact: 'Gemini 原生请求没有完整监控记录',
+        detect: `CHAT_COMPLETION_SOURCES.MAKERSUITE,
+            CHAT_COMPLETION_SOURCES.VERTEXAI,`,
+        anchor: `            CHAT_COMPLETION_SOURCES.WORKERS_AI,
+        ];`,
+        build: () => `            CHAT_COMPLETION_SOURCES.WORKERS_AI,
+            CHAT_COMPLETION_SOURCES.MAKERSUITE,
+            CHAT_COMPLETION_SOURCES.VERTEXAI,
+        ];`,
+    },
+    {
+        id: 'gemini-dispatch',
+        label: 'Gemini 所有返回分支完成落盘',
+        impact: 'Gemini 原生请求没有完整监控记录',
+        detect: `const result = await sendMakerSuiteRequest(request, response, monitor);`,
+        anchor: `            case CHAT_COMPLETION_SOURCES.MAKERSUITE: return await sendMakerSuiteRequest(request, response);
+            case CHAT_COMPLETION_SOURCES.VERTEXAI: return await sendMakerSuiteRequest(request, response);`,
+        build: () => `            case CHAT_COMPLETION_SOURCES.MAKERSUITE:
+            case CHAT_COMPLETION_SOURCES.VERTEXAI: {
+                const result = await sendMakerSuiteRequest(request, response, monitor);
+                if (response.statusCode >= 400 && !monitor?.run.error) {
+                    monitor?.captureError(new Error(\`Gemini request failed (HTTP \${response.statusCode})\`));
+                }
+                await monitor?.finalize({
+                    outcome: monitor?.run.error ? 'error_response' : (request.body.stream ? 'stream' : 'json'),
+                });
+                return result;
+            }`,
+    },
+    {
+        id: 'gemini-fetch',
+        label: 'Gemini 上游请求耗时和状态',
+        impact: 'Gemini 原生请求没有完整监控记录',
+        detect: `monitor?.setHttpStatus(generateResponse.status);`,
+        anchor: `        const generateResponse = await fetch(url, {
+            body: JSON.stringify(body),
+            method: 'POST',
+            headers: headers,
+            signal: controller.signal,
+        });`,
+        build: () => `        monitor?.mark('upstream_request_started');
+        const generateResponse = await fetch(url, {
+            body: JSON.stringify(body),
+            method: 'POST',
+            headers: headers,
+            signal: controller.signal,
+        });
+        monitor?.setHttpStatus(generateResponse.status);
+        monitor?.mark('upstream_headers_received');
+        if (!generateResponse.ok) {
+            monitor?.captureError(new Error(\`\${apiName} API returned HTTP \${generateResponse.status} \${generateResponse.statusText}\`));
+        }`,
+    },
+    {
+        id: 'gemini-stream',
+        label: 'Gemini 原生 SSE 流监控',
+        impact: 'Gemini 原生请求没有完整监控记录',
+        detect: `monitor?.attachStream(generateResponse);`,
+        anchor: `                // Pipe remote SSE stream to Express response
+                await forwardFetchResponse(generateResponse, response);`,
+        build: () => `                // Pipe remote SSE stream to Express response
+                monitor?.attachStream(generateResponse);
+                await forwardFetchResponse(generateResponse, response);`,
+    },
+    {
+        id: 'gemini-stream-error',
+        label: 'Gemini 流转发异常记录',
+        impact: 'Gemini 原生请求没有完整监控记录',
+        detect: `monitor?.captureError(error);
+                console.error('Error forwarding streaming response:', error);`,
+        anchor: `                console.error('Error forwarding streaming response:', error);`,
+        build: () => `                monitor?.captureError(error);
+                console.error('Error forwarding streaming response:', error);`,
+    },
+    {
+        id: 'gemini-json',
+        label: 'Gemini 非流式正文和 usage',
+        impact: 'Gemini 原生请求没有完整监控记录',
+        detect: `monitor?.captureJson(generateResponseJson);`,
+        anchor: `            const generateResponseJson = await generateResponse.json();
+
+            const candidates = generateResponseJson?.candidates;`,
+        build: () => `            const generateResponseJson = await generateResponse.json();
+            monitor?.captureJson(generateResponseJson);
+
+            const candidates = generateResponseJson?.candidates;`,
+    },
+    {
+        id: 'gemini-no-candidate',
+        label: 'Gemini 无候选回复或安全拦截记录',
+        impact: 'Gemini 原生请求没有完整监控记录',
+        detect: `monitor?.captureError(new Error(message));
+                return response.send({ error: { message } });
+            }
+
+            const responseContent`,
+        anchor: `                return response.send({ error: { message } });
+            }
+
+            const responseContent = candidates[0].content ?? candidates[0].output;`,
+        build: () => `                monitor?.captureError(new Error(message));
+                return response.send({ error: { message } });
+            }
+
+            const responseContent = candidates[0].content ?? candidates[0].output;`,
+    },
+    {
+        id: 'gemini-empty',
+        label: 'Gemini 空正文记录',
+        impact: 'Gemini 原生请求没有完整监控记录',
+        detect: `console.warn(message, generateResponseJson);
+                monitor?.captureError(new Error(message));`,
+        anchor: `                let message = \`\${apiName} Candidate text empty\`;
+                console.warn(message, generateResponseJson);
+                return response.send({ error: { message } });`,
+        build: () => `                let message = \`\${apiName} Candidate text empty\`;
+                console.warn(message, generateResponseJson);
+                monitor?.captureError(new Error(message));
+                return response.send({ error: { message } });`,
+    },
+    {
+        id: 'gemini-exception',
+        label: 'Gemini 网络异常与中止记录',
+        impact: 'Gemini 原生请求没有完整监控记录',
+        detect: `monitor?.captureError(error);
+        console.error(\`Error communicating with \${apiName} API:\`, error);`,
+        anchor: `        console.error(\`Error communicating with \${apiName} API:\`, error);`,
+        build: () => `        monitor?.captureError(error);
+        console.error(\`Error communicating with \${apiName} API:\`, error);`,
+    },
 ];
 
 // Luker routes requests through a provider-independent dispatch pipeline. Keep
@@ -174,7 +320,7 @@ export function getChatCompletionsPatches(source) {
  * @param {string} source chat-completions.js 的全文
  */
 export function inspectChatCompletionsPatches(source) {
-    const text = typeof source === 'string' ? source : '';
+    const text = typeof source === 'string' ? source.replace(/\r\n/g, '\n') : '';
     const results = getChatCompletionsPatches(text).map((patch) => ({
         id: patch.id,
         label: patch.label,
